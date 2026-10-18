@@ -98,8 +98,16 @@ static int shared_objects(id<MTLDevice> dev) {
     if (!g_dev) g_dev = dev;
     if (g_dev != dev) { ULOG("textures of another device: game's own upscale stays"); ok = 0; }
     if (ok && !g_rs) { g_rs = [g_dev newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:&e]; if (!g_rs) { ULOG("residency set: %s", e.localizedDescription.UTF8String); ok = 0; } }
+    #if DM_NVN_M3
+    /* macOS 15 走经典 MTLFXSpatialScaler（macOS 13 起）：不需要 MTL4 编译器，能力判定用 supportsDevice:
+       macOS 15 takes the classic MTLFXSpatialScaler (macOS 13+): no MTL4 compiler, capability via supportsDevice: */
+    if (ok && ![MTLFXSpatialScalerDescriptor supportsDevice:g_dev]) { ULOG("this GPU has no MetalFX spatial scaler: game's own upscale stays"); ok = 0; }
+#else
     if (ok && ![MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev]) { ULOG("this GPU has no Metal 4 MetalFX spatial scaler: game's own upscale stays"); ok = 0; }
+#endif
+    #if !DM_NVN_M3
     if (ok && !g_comp) { g_comp = [g_dev newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&e]; if (!g_comp) { ULOG("MTL4 compiler: %s", e.localizedDescription.UTF8String); ok = 0; } }
+#endif
     if (ok && !g_build_q) g_build_q = dispatch_queue_create("totk.mfxup.build", DISPATCH_QUEUE_SERIAL);
     pthread_mutex_unlock(&g_mu);
     return ok;
@@ -127,7 +135,11 @@ static void build(int ci, cfg_t cfg, NSUInteger src_usage, NSUInteger dst_usage,
         d.colorTextureFormat = cfg.in_fmt; d.outputTextureFormat = outs[i];
         d.inputWidth = cfg.in_w; d.inputHeight = cfg.in_h; d.outputWidth = cfg.out_w; d.outputHeight = cfg.out_h;
         d.colorProcessingMode = (MTLFXSpatialScalerColorProcessingMode)cfg.mode;
+#if DM_NVN_M3
+        b.sc = [d newSpatialScalerWithDevice:g_dev];
+#else
         b.sc = [d newSpatialScalerWithDevice:g_dev compiler:g_comp];
+#endif
     }
     if (!b.sc) why = "spatial scaler not created";
     else if ((src_usage & b.sc.colorTextureUsage) != b.sc.colorTextureUsage) why = "the source's usage lacks what MetalFX needs";
@@ -212,8 +224,14 @@ id<MTLTexture> mfxup_encode_ex(int ci, id<MTL4CommandBuffer> cb, id<MTLTexture> 
     /* MetalFX waits on the fence before reading: signal it after everything before (the producer of src, earlier users of
        the target). The next replay encoder starts with a queue barrier on all stages, which orders it after MetalFX. */
     id<MTL4ComputeCommandEncoder> e = [cb computeCommandEncoder];
+#if DM_NVN_M3
+    /* 老接口没有显式屏障与阶段化 fence：依赖由自动 hazard tracking 与无阶段 updateFence 表达
+       No explicit barrier or staged fence on the older API: dependencies come from automatic hazard tracking and the plain updateFence */
+    [e updateFence:c->fence];
+#else
     [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
     [e updateFence:c->fence afterEncoderStages:MTLStageDispatch];
+#endif
     [e endEncoding];
     b->sc.colorTexture = src; b->sc.outputTexture = out; b->sc.inputContentWidth = in_w; b->sc.inputContentHeight = in_h; b->sc.fence = c->fence;
     [b->sc encodeToCommandBuffer:cb];

@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #import <Metal/Metal.h>
+#include "m3_compat.h"   // DM_NVN_M3：Metal 3 兼容层
 #include "nvn_deswizzle.h"
 
 int nvn_deswz_gpu_init(id<MTLDevice> dev);

@@ -1,6 +1,7 @@
 /* Native macOS controllers feed the same FullKey state as the keyboard. */
 #import <Foundation/Foundation.h>
 #import <GameController/GameController.h>
+#include <dispatch/dispatch.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -46,34 +47,93 @@ static uint64_t gamepad_buttons(GCExtendedGamepad *pad) {
     return buttons;
 }
 
+/* The older, non-extended profile: face buttons, shoulders, triggers and the d-pad (no thumbsticks). Most macOS
+   controllers expose GCExtendedGamepad, but a few cheap / legacy pads only expose GCGamepad; map what exists. */
+static uint64_t gamepad_buttons_legacy(GCGamepad *pad) {
+    uint64_t buttons = 0;
+    if (pad.buttonA.isPressed) buttons |= 1ULL << 0;
+    if (pad.buttonB.isPressed) buttons |= 1ULL << 1;
+    if (pad.buttonX.isPressed) buttons |= 1ULL << 2;
+    if (pad.buttonY.isPressed) buttons |= 1ULL << 3;
+    if (pad.leftShoulder.isPressed) buttons |= 1ULL << 6;
+    if (pad.rightShoulder.isPressed) buttons |= 1ULL << 7;
+    if (pad.dpad.left.isPressed) buttons |= 1ULL << 12;
+    if (pad.dpad.up.isPressed) buttons |= 1ULL << 13;
+    if (pad.dpad.right.isPressed) buttons |= 1ULL << 14;
+    if (pad.dpad.down.isPressed) buttons |= 1ULL << 15;
+    return buttons;
+}
+
+/* TOTK_GAMEPAD_SWAP_ABXY=1: swap the face buttons (A<->B, X<->Y) for users who prefer the opposite layout. */
+static int gamepad_swap_abxy_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_GAMEPAD_SWAP_ABXY"); on = e && atoi(e); } return on; }
+static uint64_t gamepad_swap_abxy(uint64_t b) {
+    if (!gamepad_swap_abxy_on()) return b;
+    uint64_t r = b & ~0xFULL;
+    if (b & 1) r |= 2; if (b & 2) r |= 1; if (b & 4) r |= 8; if (b & 8) r |= 4;
+    return r;
+}
+
+static int gamepad_log_on(void) { static int on = -1; if (on < 0) on = getenv("TOTK_GAMEPAD_LOG") != NULL; return on; }
+
 static void refresh_gamepads(void) {
     RuntimeGamepadState next = {0};
     for (GCController *controller in GCController.controllers) {
         GCExtendedGamepad *pad = controller.extendedGamepad;
-        if (!pad) continue;
-        next.connected = 1;
-        next.buttons |= gamepad_buttons(pad);
-        next.lx = stronger_axis(next.lx, stick_axis(pad.leftThumbstick.xAxis.value));
-        next.ly = stronger_axis(next.ly, stick_axis(pad.leftThumbstick.yAxis.value));
-        next.rx = stronger_axis(next.rx, stick_axis(pad.rightThumbstick.xAxis.value));
-        next.ry = stronger_axis(next.ry, stick_axis(pad.rightThumbstick.yAxis.value));
+        if (pad) {
+            next.connected = 1;
+            next.buttons |= gamepad_buttons(pad);
+            next.lx = stronger_axis(next.lx, stick_axis(pad.leftThumbstick.xAxis.value));
+            next.ly = stronger_axis(next.ly, stick_axis(pad.leftThumbstick.yAxis.value));
+            next.rx = stronger_axis(next.rx, stick_axis(pad.rightThumbstick.xAxis.value));
+            next.ry = stronger_axis(next.ry, stick_axis(pad.rightThumbstick.yAxis.value));
+        } else if (controller.gamepad) {
+            next.connected = 1;
+            next.buttons |= gamepad_buttons_legacy(controller.gamepad);
+        }
     }
+    next.buttons = gamepad_swap_abxy(next.buttons);
     pthread_mutex_lock(&gamepadLock);
+    uint64_t prev = gamepadState.buttons;
     pressedEdges |= next.buttons & ~gamepadState.buttons;
+    /* Sticks change continuously; log them only after a sizeable move (and the return to centre), so a pad test
+       shows the actual axis values without flooding the log. */
+    static RuntimeGamepadState logged;
+    int stick_moved = abs(next.lx - logged.lx) > 8000 || abs(next.ly - logged.ly) > 8000 ||
+                      abs(next.rx - logged.rx) > 8000 || abs(next.ry - logged.ry) > 8000;
+    if (gamepad_log_on() && (next.buttons != prev || next.connected != gamepadState.connected || stick_moved)) {
+        fprintf(stderr, "[totk-input] gamepad state: connected=%d buttons=%#llx lx=%d ly=%d rx=%d ry=%d\n",
+                next.connected, (unsigned long long)next.buttons, next.lx, next.ly, next.rx, next.ry);
+        logged = next;
+    }
     gamepadState = next;
     pthread_mutex_unlock(&gamepadLock);
 }
 
 static void attach_gamepad(GCController *controller) {
     GCExtendedGamepad *pad = controller.extendedGamepad;
-    if (!pad) return;
-    pad.valueChangedHandler = ^(GCExtendedGamepad *changed, GCControllerElement *element) {
-        (void)changed; (void)element;
-        refresh_gamepads();
-    };
-    fprintf(stderr, "[totk-input] native gamepad connected: %s (%s)\n",
+    GCGamepad *legacy = pad ? nil : controller.gamepad;
+    if (!pad && !legacy) {
+        fprintf(stderr, "[totk-input] native controller %s (%s) has no gamepad profile (extended=%d gamepad=%d)\n",
+                (controller.vendorName ?: @"unknown").UTF8String,
+                (controller.productCategory ?: @"unknown").UTF8String,
+                controller.extendedGamepad != nil, controller.gamepad != nil);
+        return;
+    }
+    if (pad) {
+        pad.valueChangedHandler = ^(GCExtendedGamepad *changed, GCControllerElement *element) {
+            (void)changed; (void)element;
+            refresh_gamepads();
+        };
+    } else {
+        legacy.valueChangedHandler = ^(GCGamepad *changed, GCControllerElement *element) {
+            (void)changed; (void)element;
+            refresh_gamepads();
+        };
+    }
+    fprintf(stderr, "[totk-input] native gamepad connected: %s (%s), %s profile\n",
             (controller.vendorName ?: @"unknown").UTF8String,
-            (controller.productCategory ?: @"unknown").UTF8String);
+            (controller.productCategory ?: @"unknown").UTF8String,
+            pad ? "extended" : "legacy");
     runtime_feedback_attach(controller);
     refresh_gamepads();
 }
@@ -92,8 +152,18 @@ void runtime_gamepad_start(void) {
                        runtime_feedback_detach(controller);
                        refresh_gamepads();
                    }];
+    fprintf(stderr, "[totk-input] native gamepads at start: %lu\n", (unsigned long)GCController.controllers.count);
     for (GCController *controller in GCController.controllers) attach_gamepad(controller);
-    [GCController startWirelessControllerDiscoveryWithCompletionHandler:nil];
+    /* 无线发现要等主 run loop 起来：runtime_gamepad_start 在 [NSApp run] 之前调用，直接扫可能永远扫不到。
+       Wireless discovery needs the main run loop, which starts after this setup ([NSApp run]); starting the scan
+       before that can make it never run. */
+    dispatch_async(dispatch_get_main_queue(), ^{
+        fprintf(stderr, "[totk-input] controller discovery started\n");
+        [GCController startWirelessControllerDiscoveryWithCompletionHandler:^{
+            NSUInteger n = GCController.controllers.count;
+            fprintf(stderr, "[totk-input] controller discovery finished: %lu native gamepad(s); keyboard still works\n", (unsigned long)n);
+        }];
+    });
 }
 
 void runtime_gamepad_clear(void) {

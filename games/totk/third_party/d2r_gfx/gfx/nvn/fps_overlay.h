@@ -13,6 +13,11 @@ enum { FPS_OVERLAY_TEX_W = 768, FPS_OVERLAY_TEX_H = 64, FPS_OVERLAY_MAX_SCALE = 
 typedef struct { int fps, screen_w, screen_h, mfx, gen, big; } fps_overlay_info;
 
 int fps_overlay_enabled(void);
+/* Key 4 / TOTK_OVERLAY_HIDDEN: show or hide all three performance boxes at run time (FPS, shader count, load line).
+   The environment variables still choose the per-box defaults at start. */
+void totk_overlays_toggle(void);
+int totk_overlays_visible(void);
+
 /* Shared user toggle for every in-picture HUD layer: FPS, shader collection and load telemetry. */
 int fps_overlay_hints_enabled(void);
 int fps_overlay_toggle_hints(void);   /* atomically toggles all HUD layers and returns the new visibility */

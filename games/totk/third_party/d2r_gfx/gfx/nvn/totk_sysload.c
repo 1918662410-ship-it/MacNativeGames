@@ -6,6 +6,7 @@
 // - the game's GPU share: the union of our command buffers' GPU intervals (sysload_note_gpu) per wall time.
 // It never touches the game threads; reading the device tree / IOKit happens on its own thread.
 #include "totk_sysload.h"
+#include "fps_overlay.h"   // totk_overlays_visible(): key 4 hides all three boxes
 #include <TargetConditionals.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
@@ -33,7 +34,7 @@ int sysload_enabled(void) {
     const int def = 1;
 #endif
     if (on < 0) { const char *e = getenv("TOTK_LOAD_OVERLAY"); on = e ? strcmp(e, "0") != 0 : def; }
-    return on;
+    return on && totk_overlays_visible();
 }
 
 double sysload_busy_add(sysload_busy *b, double s, double e) {

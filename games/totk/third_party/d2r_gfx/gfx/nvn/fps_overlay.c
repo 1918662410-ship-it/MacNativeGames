@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 enum { GLYPH_W = 5, GLYPH_H = 7, ADVANCE = 6, PAD = 2, BOX_ROWS = GLYPH_H + 2 * PAD, MAX_CHARS = 80 };
 static const uint8_t TEXT_BGRA[4] = {120, 255, 80, 255}, BOX_BGRA[4] = {12, 12, 12, 255}, HIGHLIGHT_BGRA[4] = {40, 230, 255, 255};   // green / dark / yellow
@@ -36,6 +37,20 @@ static const Glyph FONT[] = {
     {' ', {0, 0, 0, 0, 0, 0, 0}},
 };
 
+static _Atomic int g_overlays_hidden;
+void totk_overlays_toggle(void) {
+    /* Debounce: one press can reach the toggle more than once (key auto-repeat / several paths); collapse calls
+       within 300 ms so a press is always one toggle. */
+    static _Atomic uint64_t last_ns;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), prev = atomic_load(&last_ns);
+    if (now - prev < 300000000ull) return;
+    if (!atomic_compare_exchange_strong(&last_ns, &prev, now)) return;
+    int hidden = !atomic_load(&g_overlays_hidden);
+    atomic_store(&g_overlays_hidden, hidden);
+    fprintf(stderr, "[totk] on-screen performance boxes %s (key 4)\n", hidden ? "hidden" : "shown");
+}
+int totk_overlays_visible(void) { return !atomic_load(&g_overlays_hidden); }
+
 static _Atomic int g_hints_visible = 1;
 int fps_overlay_hints_enabled(void) { return atomic_load_explicit(&g_hints_visible, memory_order_relaxed); }
 int fps_overlay_toggle_hints(void) { return !atomic_fetch_xor_explicit(&g_hints_visible, 1, memory_order_relaxed); }
@@ -43,7 +58,7 @@ int fps_overlay_toggle_hints(void) { return !atomic_fetch_xor_explicit(&g_hints_
 int fps_overlay_enabled(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("TOTK_FPS_OVERLAY"); on = !(e && !strcmp(e, "0")); }
-    return on;
+    return on && totk_overlays_visible();
 }
 
 int fps_overlay_scale(double view_h) {
@@ -162,7 +177,7 @@ int shader_overlay_enabled(void) {
     const int def = 1;
 #endif
     if (on < 0) { const char *e = getenv("TOTK_SHADER_OVERLAY"); on = e ? strcmp(e, "0") != 0 : def; }
-    return on;
+    return on && totk_overlays_visible();
 }
 
 void shader_overlay_text(char *out, size_t n, uint64_t fresh, int64_t total, uint64_t pipelines) {

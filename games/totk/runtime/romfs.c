@@ -44,7 +44,7 @@ static uint64_t handles[NH]; /* file index + 1; 0 is free */
    are served in place of the originals. Each line names a RomFS path, the overlay's size and SHA-256 and the original's
    SHA-256; a missing path, a size or hash mismatch or a changed original stops the start (regenerate the overlay).
    TOTK_ROMFS_PATCHES=0 serves the originals. */
-#define NOVL 16
+#define NOVL 255   /* handle_ovl is uint8_t: slot+1 must fit; 255 leaves ~252 files for user mods */
 static struct { uint64_t index,size; int fd; } overlays[NOVL];
 static unsigned noverlay;
 static uint8_t handle_ovl[NH]; /* overlay slot + 1 of an open handle, 0 = original */

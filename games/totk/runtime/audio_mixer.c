@@ -458,6 +458,9 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
     }
     static float lr[MAX_FRAME * 2];
     memset(lr, 0, sizeof(float) * 2 * (size_t)frames);
+    { static int sink_logged; if (sink && !sink_logged) { sink_logged = 1;
+        fprintf(stderr, "[totk-audio] device sink: %u input(s), downmix %d, output volume %.2f\n",
+                sink->input_count, sink->downmix_enabled, device_volume); } }
     if (sink && sink->input_count >= 1 && sink->input_count <= 6) {
         const float gain = device_volume * (r->mixes[0].in_use ? r->mixes[0].volume : 1.0f);
         const float *ch[6] = {0};
@@ -474,7 +477,12 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
             l *= gain; rr *= gain;
             lr[2 * k] = l > 1 ? 1 : l < -1 ? -1 : l; lr[2 * k + 1] = rr > 1 ? 1 : rr < -1 ? -1 : rr;
         }
-    } else if (!sink) report_once(m, 5, "no device sink in use", r->param.sink_count);
+    } else if (!sink) {
+        /* 游戏在第一次 RequestUpdate 之后才配 device sink，启动头几帧没有 sink 是正常的；持续 1 s 没有才报红。
+           The game configures its device sink after the first RequestUpdate, so no sink in the first few frames is
+           normal; only report if it is still missing after one second. */
+        static unsigned miss; if (++miss == 200) report_once(m, 5, "no device sink after 1 s (sink_count)", r->param.sink_count);
+    }
     { static double sum, peak; static uint64_t count, frames_total;   /* level report every ~5 s: evidence that sound is produced */
       for (int k = 0; k < 2 * frames; k++) { double x = lr[k]; sum += x * x; if (fabs(x) > peak) peak = fabs(x); }
       count += 2 * (uint64_t)frames; frames_total += (uint64_t)frames;
@@ -509,7 +517,7 @@ void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) 
     int pointer;
     switch (rq->cmd) {
     case 0: case 6: { IpcBuffer b = out_buffer(rq, &pointer); int32_t n = b.size >= 0x100 ? 1 : 0; if (n) put_name(&b, rs, pointer); IPC_OUT(rs, n); return; }   /* ListAudioDeviceName(Auto) */
-    case 1: case 7: device_volume = IPC_ARG(rq, float, 0); return;                                    /* SetAudioDeviceOutputVolume(Auto) */
+    case 1: case 7: { float v = IPC_ARG(rq, float, 0); if (v != device_volume) fprintf(stderr, "[totk-audio] output volume: %.2f\n", v); device_volume = v; return; }   /* SetAudioDeviceOutputVolume(Auto) */
     case 2: case 8: IPC_OUT(rs, device_volume); return;                                              /* GetAudioDeviceOutputVolume(Auto) */
     case 3: case 10: { IpcBuffer b = out_buffer(rq, &pointer); put_name(&b, rs, pointer); return; }  /* GetActiveAudioDeviceName(Auto) */
     case 5: { int32_t n = 2; IPC_OUT(rs, n); return; }                                               /* GetActiveChannelCount */

@@ -61,7 +61,7 @@ int nvn_deswz_gpu_encode_m4(id<MTL4ComputeCommandEncoder> enc, id<MTL4ArgumentTa
         src_off, dst_off, base, dst_pitch, row_bytes, rows, slices, th, td
     };
     memcpy((uint8_t *)params.contents + params_off, &p, sizeof p);
-    [enc setArgumentTable:table];
+    m3_attach(table, enc, M3_STAGE_COMPUTE);
     [enc setComputePipelineState:g_nvn_deswz_pipeline];
     [table setAddress:src.gpuAddress atIndex:0];
     [table setAddress:dst.gpuAddress atIndex:1];

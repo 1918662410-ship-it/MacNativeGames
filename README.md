@@ -36,10 +36,45 @@ Shaders are automatically collected, compiled and cached as you play. Returning 
 
 ## What you need
 
-- A Mac with Apple silicon and **macOS 26** or later (the graphics use Metal 4). 16 GB of memory or more is recommended.
+- A Mac with Apple silicon and **macOS 15** or later (this local fork uses the Metal 3 backend; the upstream Metal 4 build needs macOS 26). 16 GB of memory or more is recommended.
 - About **25 GB** of free disk space for the work folder, in addition to your game file. Keep the output app on the **same APFS volume** to share the large data files through cloning. If cloning is unavailable or the app is on another volume, allow roughly **17 GB more** for the app copy.
 - Your Tears of the Kingdom **base game 1.0.0** (`0100F2C0115B6000`) as an **XCI or NSP**, and your `prod.keys`. To build **1.1.2 or 1.4.3**, supply its separate cumulative update as NSP or NSZ with `--update`; no intermediate update is required. NSZ is decompressed and its NCA hashes are verified before extraction. DLC and combined packages are unsupported.
 - For NSP: its common ticket must be included unless the NCAs are rights-free. NSPs do not contain system shared fonts: supply an unpacked firmware NCA directory with `--firmware`, or previously extracted fonts with `--shared-fonts`. The six fonts must match this project’s verified hashes; valid fonts already in the work folder are reused.
+
+## Local M3 build and launcher (this fork)
+
+This checkout keeps the upstream 1.4.3 version support, shader prewarming, audio and MetalFX fixes, but runs the
+graphics on the **Metal 3** backend so it works on macOS 15. Build with `TOTK_M3=1`:
+
+```bash
+TOTK_M3=1 python3.14 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys \
+  --update ~/Games/1.4.3.nsz -o ~/TOTK.app
+```
+
+The final app is named **Tears of the Kingdom.app**. The app opens a launcher where you can choose a save profile, a mod overlay, the three performance overlays, a
+1x canvas / MetalFX-output performance mode, a MetalFX spatial-upscale switch, **full screen** (a normal titled window
+maximized to the visible frame), a custom **game output resolution** (`TOTK_OUTPUT_RES`, the composition canvas/UI), one-click **aspect
+ratio presets** (16:9, 16:10, 4:2/2:1, 3:2, 4:3, 21:9), a custom **window size** (`TOTK_WINDOW_SIZE`), a **picture fill**
+mode, controller connection status, AB/XY swap and rumble/motion. It also
+has **跳过首次着色器预热** (skip the first shader warm-up): leave it off for the smoothest play; the first launch then
+spends several minutes in a visible "预热着色器与管线" progress window before the first frame. Skipping is faster to
+reach the title, but newly seen shaders compile on demand and can show black tiles or hitches until they are cached.
+Settings live in `~/Library/Application Support/MacNativeGames/TOTK/launcher-settings.json`. `TOTK_LAUNCHER_AUTO=1`
+(or `--play`) skips the window.
+
+**Full screen** has two modes: **checked** opens a true borderless full-screen window covering the whole display (no title
+bar, no menu bar/Dock); **unchecked** opens a normal titled window maximized to the screen's visible frame (title bar and
+menu bar visible). Every aspect preset checks the full-screen box. The game menu strings are “添加Mod”, “性能模式：1x 画布”,
+“HD 震动” and “六轴体感”. **Picture fill** decides what happens to the game picture on a non-matching display:
+**保持比例** keeps the aspect with bars; **拉伸铺满** fills the whole screen (non-uniform, some distortion); **裁剪铺满**
+fills uniformly and cuts the overflowing edges (no distortion, some side content lost). The output-resolution field changes
+the game's own composition canvas and UI (e.g. 2560x1440), not every internal 3D pass: the 3D scene still follows the
+game's render scaling, and the fill/present pass scales the whole final picture to the screen. The aspect presets set that
+output canvas to 16:9/16:10/4:2/3:2/4:3/21:9 (2560-wide, with the matching HeapDef overlays built into the app); leave the
+field empty (or `auto`) for the default. Window size is the starting window size when not full screen.
+
+The shipped default is **1920x1080 / 16:9 / 拉伸铺满 / true full screen / overlays off / no MetalFX**: about **120 FPS** in
+true full screen and 116 FPS in the titled maximized window on this Mac. The 3:2 2K preset is ~98 FPS, 16:9 2K ~105 FPS; choose 3:2 for fidelity or 1920x1080 for the smoothest play.
 
 ## Build the app
 
@@ -119,7 +154,7 @@ Controllers recognized by macOS (such as DualSense and Xbox controllers) are map
 | F T H G | d-pad left / up / right / down | | Z / C | left / right stick press |
 | Return | + (menu) | | Tab, Esc | − (map) |
 
-Extra keys: **1** show or hide all on-screen overlays (shortcut reminder, FPS, shader count and system-load readings), **2** frame interpolation (off → 30+30 → half the refresh rate → unlimited), **3** cycle picture mode (MetalFX 2K → native 2K → off). MetalFX is off by default and only starts when you select its mode with **3**; resizing the window never enables it automatically. Text entry (naming a horse) uses the Mac keyboard.
+Extra keys: **1** toggle MetalFX spatial upscaling, **2** cycle frame interpolation (off → 30+30 → half the refresh rate → unlimited), **3** cycle picture mode (MetalFX 2K → native 2K → off), **4** hide/show the three performance boxes. MetalFX spatial upscaling is off by default on this Metal 3 build; enabling it is safe once the startup shaders are warm. Text entry (naming a horse) uses the Mac keyboard.
 
 Native 2K changes the game's composition canvas and UI to 2560×1440. The 3D scene still follows the game's separate render scaling; this does not force every internal render target to 1440p. The manual MetalFX mode also works in smaller windows and scales to the actual output size, including 4K.
 
@@ -193,10 +228,37 @@ MIT (see [LICENSE](LICENSE)). Third-party code keeps its own license: [THIRD_PAR
 
 ## 需要准备
 
-- Apple 芯片的 Mac，**macOS 26** 或更高（图形用 Metal 4）。建议使用 16 GB 或更多内存。
+- Apple 芯片的 Mac，**macOS 15** 或更高（本地 fork 使用 Metal 3 后端；上游 Metal 4 版需要 macOS 26）。建议使用 16 GB 或更多内存。
 - 除游戏文件外，为工作目录预留约 **25 GB** 空闲空间。成品 App 与工作目录放在**同一个 APFS 卷**上时，大型数据文件可通过克隆共享磁盘空间；无法克隆或输出到其他卷时，还需为 App 副本另留约 **17 GB**。
 - 你的《王国之泪》**本体 1.0.0**（`0100F2C0115B6000`），格式为 **XCI 或 NSP**，以及你的 `prod.keys`。构建 **1.1.2 或 1.4.3** 时，通过 `--update` 提供单独的累计更新 NSP 或 NSZ；无需先安装中间版本。NSZ 会先解压并校验其中的 NCA 哈希。DLC 和合并包不支持。
 - 使用 NSP 时：除不依赖票据的 NCA 外，包内必须包含通用票据。NSP 不含系统共享字体，需要通过 `--firmware` 指定已解包的固件 NCA 目录，或通过 `--shared-fonts` 提供以前提取的字体。六个字体必须符合本项目已验证的哈希；工作目录中已有且校验通过的字体会自动复用。
+
+## 本地 M3 构建与启动器（本 fork）
+
+本 checkout 保留了上游的 1.4.3 版本支持、着色器预热、音频与 MetalFX 修复，但图形走 **Metal 3** 后端，因此
+macOS 15 可用。构建时加 `TOTK_M3=1`：
+
+```bash
+TOTK_M3=1 python3.14 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys \
+  --update ~/Games/1.4.3.nsz -o ~/TOTK.app
+```
+
+App 打开后是启动器：可选存档 profile、mod overlay、三个性能浮层、1x 画布 / 关 MetalFX 输出性能模式、
+MetalFX 空间超分开关、**全屏启动**（无边框覆盖整屏）、自定义**游戏输出分辨率**（`TOTK_OUTPUT_RES`，合成画布/UI）、
+**一键比例**（16:9/16:10/4:2/3:2/4:3/21:9）、**窗口大小**（`TOTK_WINDOW_SIZE`）、**画面填充**（保持比例/拉伸铺满/裁剪铺满）、
+手柄连接状态、AB/XY 对调、震动/体感；还有 **跳过首次着色器预热**。建议不跳过：首次启动会显示
+“预热着色器与管线”进度窗，几分钟后才出第一帧，但之后最流畅。跳过会更快到标题，但新着色器现编，
+在缓存完成前可能出现黑色块/卡顿。选项存在
+`~/Library/Application Support/MacNativeGames/TOTK/launcher-settings.json`；`TOTK_LAUNCHER_AUTO=1`（或
+`--play`）跳过窗口。
+
+**全屏**有两种模式：**勾选**时为真正的无边框全屏（覆盖整个屏幕，无标题栏、无菜单栏/Dock）；**不勾选**时为普通
+带标题栏窗口最大化到屏幕可用区域（标题栏和菜单栏可见）。所有比例预设都会自动勾选全屏。启动器文案为“添加Mod”、
+“性能模式：1x 画布”、“HD 震动”、“六轴体感”。**画面填充**决定游戏画面在比例不匹配的屏幕上怎么放：**保持比例**留黑边；
+**拉伸铺满**非等比填满（有形变）；**裁剪铺满**等比填满并裁掉溢出边缘（无形变，会少两侧少量画面）。输出分辨率改的
+是游戏自己的合成画布和 UI（例如 2560x1440），不是强制每个内部 3D 通道；3D 场景仍按游戏的渲染缩放，最后由
+填充/上屏把**整个最终画面**缩放到屏幕。比例预设把输出画布设为 16:9/16:10/4:2/3:2/4:3/21:9（2560 宽，App 已内置
+对应 HeapDef overlay）；留空（或 `auto`）使用默认。窗口大小是非全屏时的起始窗口尺寸。
 
 ## 打包 App
 
@@ -276,7 +338,7 @@ macOS 能识别的手柄（如 DualSense、Xbox 手柄）会映射为 Switch Pro
 | F T H G | 十字键 左 / 上 / 右 / 下 | | Z / C | 左 / 右摇杆按下 |
 | Return | +（菜单） | | Tab、Esc | −（地图） |
 
-额外按键：**1** 同时隐藏或重新显示所有屏幕提示（快捷键说明、FPS、着色器计数和系统负载）；**2** 补帧（关 → 30+30 → 刷新率一半 → 不限帧），**3** 循环切换画质（MetalFX 2K → 原生 2K → 关闭）。MetalFX 默认关闭，只有按 **3** 手动切换到该模式才会启用；放大窗口不会自动开启。文字输入（给马取名）直接用 Mac 键盘。
+额外按键：**1** 切换 MetalFX 空间超分；**2** 补帧（关 → 30+30 → 刷新率一半 → 不限帧）；**3** 循环切换画质（MetalFX 2K → 原生 2K → 关闭）；**4** 显示/隐藏三个性能浮层。Metal 3 版默认关闭 MetalFX 空间超分；首次预热完成后可安全开启。文字输入（给马取名）直接用 Mac 键盘。
 
 原生 2K 将游戏合成画布和 UI 改为 2560×1440，3D 场景仍由游戏独立的渲染比例控制，并非强制所有内部通道以 1440p 渲染。手动 MetalFX 在较小窗口中也可使用，输出放大会跟随实际窗口尺寸，包括 4K。
 

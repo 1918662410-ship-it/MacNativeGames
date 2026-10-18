@@ -182,6 +182,20 @@ void runtime_feedback_attach(GCController *c) {   /* main queue */
             NSMutableArray *where = [NSMutableArray array]; for (NSString *l in c.haptics.supportedLocalities) [where addObject:l];
             fprintf(stderr, "[rumble] %s: haptics (%s)\n", name, [where componentsJoinedByString:@", "].UTF8String);
         } else fprintf(stderr, "[rumble] %s has no haptics: no rumble from it\n", name);
+        if (c.haptics && getenv("TOTK_RUMBLE_TEST")) {
+            /* Diagnostic: a fixed 2 s pattern, so the haptics path can be checked without waiting for a game event. */
+            fprintf(stderr, "[rumble] self-test: short pattern in 1 s (left 0.8/160+0.2/320, right swapped; the 250 ms stale policy ends it early)\n");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1000ull * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+                runtime_rumble_set(0, 0.8f, 160, 0.2f, 320);
+                runtime_rumble_set(1, 0.2f, 160, 0.8f, 320);
+            });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3000ull * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+                runtime_rumble_set(0, 0, 160, 0, 320); runtime_rumble_set(1, 0, 160, 0, 320);
+                fprintf(stderr, "[rumble] self-test: pattern ended\n");
+            });
+        }
+    } else if (c.haptics) {
+        fprintf(stderr, "[rumble] %s supports haptics; TOTK_RUMBLE=1 enables HD rumble\n", name);
     }
     if (runtime_gyro_enabled()) {
         static dispatch_once_t once;
@@ -196,6 +210,8 @@ void runtime_feedback_attach(GCController *c) {   /* main queue */
         m.valueChangedHandler = ^(GCMotion *changed) { motion_sample(changed); };
         motionPad = c; runtime_motion_live(1);
         fprintf(stderr, "[gyro] %s: motion sensors on (gyro%s)\n", name, m.hasGravityAndUserAcceleration ? ", gravity" : ", acceleration");
+    } else if (c.motion) {
+        fprintf(stderr, "[gyro] %s has motion sensors; TOTK_GYRO=1 enables gyro\n", name);
     }
 }
 void runtime_feedback_detach(GCController *c) {   /* main queue */

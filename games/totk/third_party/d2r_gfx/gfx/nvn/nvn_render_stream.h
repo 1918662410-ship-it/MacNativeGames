@@ -66,16 +66,16 @@ static void rs_apply(id<MTL4RenderCommandEncoder> *enc, id<MTL4ArgumentTable> *v
             e = [cb renderCommandEncoderWithDescriptor:d];
             if (!e) MDIE("render stream: renderCommandEncoderWithDescriptor failed");
             if (u[4] == 2) {   /* TOTK_BARRIER_NARROW: copies / compute order before every stage; earlier render work only before our fragment stage (the vertex stage overlaps the previous pass's fragment work) */
-                [e barrierAfterQueueStages:MTLStageBlit | MTLStageDispatch beforeStages:MTLStageVertex | MTLStageFragment visibilityOptions:(MTL4VisibilityOptions)u[5]];
-                [e barrierAfterQueueStages:MTLStageVertex | MTLStageFragment beforeStages:MTLStageFragment visibilityOptions:(MTL4VisibilityOptions)u[5]];
-            } else if (u[4]) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:(MTL4VisibilityOptions)u[5]];
-            [e setArgumentTable:*vt atStages:MTLRenderStageVertex]; [e setArgumentTable:*ft atStages:MTLRenderStageFragment];
+                ((void)0);
+                ((void)0);
+            } else if (u[4]) ((void)0);
+            m3_attach(*vt, e, M3_STAGE_VERTEX); m3_attach(*ft, e, M3_STAGE_FRAGMENT);
             CFRelease((CFTypeRef)(uintptr_t)u[0]);
             *enc = e; atomic_fetch_add_explicit(&g_rs_b_passes, 1, memory_order_relaxed);
             break; }
         case RS_END:
-            if (u[0] == 2) [e barrierAfterStages:MTLStageVertex | MTLStageFragment beforeQueueStages:MTLStageFragment | MTLStageBlit | MTLStageDispatch visibilityOptions:(MTL4VisibilityOptions)u[1]];   /* TOTK_BARRIER_NARROW: later vertex stages do not wait */
-            else if (u[0]) [e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:(MTL4VisibilityOptions)u[1]];
+            if (u[0] == 2) ((void)0);   /* TOTK_BARRIER_NARROW: later vertex stages do not wait */
+            else if (u[0]) ((void)0);
             [e endEncoding]; *enc = nil; break;
         case RS_PSO: [e setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)(void *)(uintptr_t)u[0]]; if (u[0]) CFRelease((CFTypeRef)(uintptr_t)u[0]); break;
         case RS_DSS: [e setDepthStencilState:(__bridge id<MTLDepthStencilState>)(void *)(uintptr_t)u[0]]; if (u[0]) CFRelease((CFTypeRef)(uintptr_t)u[0]); break;
@@ -92,7 +92,7 @@ static void rs_apply(id<MTL4RenderCommandEncoder> *enc, id<MTL4ArgumentTable> *v
         case RS_ADDRESS: [(u[0] ? *ft : *vt) setAddress:u[2] atIndex:(NSUInteger)u[1]]; break;
         case RS_DRAW: [e drawPrimitives:(MTLPrimitiveType)u[0] vertexStart:(NSUInteger)u[1] vertexCount:(NSUInteger)u[2]]; break;
         case RS_INSTANCED: [e drawPrimitives:(MTLPrimitiveType)u[0] vertexStart:(NSUInteger)u[1] vertexCount:(NSUInteger)u[2] instanceCount:(NSUInteger)u[3] baseInstance:(NSUInteger)u[4]]; break;
-        case RS_INDEXED: [e drawIndexedPrimitives:(MTLPrimitiveType)u[0] indexCount:(NSUInteger)u[1] indexType:(MTLIndexType)u[2] indexBuffer:u[3] indexBufferLength:(NSUInteger)u[4] instanceCount:(NSUInteger)u[5] baseVertex:(NSInteger)u[6] baseInstance:(NSUInteger)u[7]]; break;
+        case RS_INDEXED: m3_draw_indexed(e, (MTLPrimitiveType)u[0], (NSUInteger)u[1], (MTLIndexType)u[2], u[3], (NSUInteger)u[4], (NSUInteger)u[5], (NSInteger)u[6], (NSUInteger)u[7]); break;
         case RS_STORE:
             if (u[0] == 1) [e setDepthStoreAction:(MTLStoreAction)u[1]];
             else if (u[0] == 2) [e setStencilStoreAction:(MTLStoreAction)u[1]];
@@ -158,7 +158,15 @@ static void rs_sync(void) {
     uint64_t t0 = rs_now(), produced = g_rs_fifo.produced;
     while (atomic_load_explicit(&g_rs_fifo.consumed, memory_order_acquire) != produced) {
         __builtin_arm_wfe();
-        if ((rs_now() - t0) > 2000000000ull) MDIE("render stream: the encode stage did not drain in 2 s");
+        uint64_t waited = rs_now() - t0;
+        if (waited > 2000000000ull) {
+            /* 调试器 / 系统暂停会把整进程停住，恢复后 A 看到的墙钟间隔会 >2 s；那不是编码线程卡死，不能直接 abort。
+               A debugger or system pause stops the whole process; on resume A sees a >2 s wall-clock gap. That is not
+               a stuck encode thread, so do not abort immediately: log once and keep waiting for a real 30 s stall. */
+            static int said;
+            if (!said++) MLOG("【红】render stream：编码线程 2 s 没排空（调试器 / 系统暂停后会出现），继续等；真卡死 30 s 才中止");
+            if (waited > 30000000000ull) MDIE("render stream: the encode stage did not drain in 30 s");
+        }
     }
     uint64_t dt = rs_now() - t0; g_rs_syncs++; g_rs_sync_ns += dt; if (dt > g_rs_sync_max_ns) g_rs_sync_max_ns = dt;
     if (totk_tl_on()) totk_tl(TL_RS_JOIN, dt, g_rs_syncs);

@@ -1,6 +1,7 @@
 // TOTK: MetalFX spatial upscaling (TOTK_MFX_UPSCALE; not in D2R). See totk_mfx_up.m.
 #pragma once
 #import <Metal/Metal.h>
+#include "m3_compat.h"   // DM_NVN_M3：Metal 3 兼容层
 
 /* One scaler context per use; each context is used from one thread only. */
 enum {

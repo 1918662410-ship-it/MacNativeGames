@@ -190,7 +190,7 @@ static void map_module(Module *m,const char *dir) {
  uint64_t *key=(void *)(m->base+m->key_off);
  for(unsigned i=0;i<8;i++)key[i]=runtime_keys[i]*8;
  make_hash(m);
- fprintf(stderr,"[totk] mapped %s size=%zu symbols=%u\n",m->name,m->size,m->nsym);
+ fprintf(stderr,"[totk] mapped %s at %p size=%zu symbols=%u\n",m->name,m->base,m->size,m->nsym);
 }
 /* TOTK_EXPORT_IOS=<dir>: after the game patches, write each module's text [0, page_up(TEXT_END)) for ios/tools/gen_embed.py.
    Relocations never reach the text (they start at DATA_OFF), so the exported bytes differ from the verified image only at
@@ -341,7 +341,23 @@ static void crash(int num,siginfo_t *info,void *context) {
  signal_hex("[totk] signal=",num);signal_hex("fault=",(uintptr_t)info->si_addr);signal_hex("esr=",u->uc_mcontext->__es.__esr);
  {mach_vm_address_t ra=(uintptr_t)info->si_addr;mach_vm_size_t rs=0;vm_region_basic_info_data_64_t ri;mach_msg_type_number_t rc=VM_REGION_BASIC_INFO_COUNT_64;mach_port_t ro=0;
   if(mach_vm_region(mach_task_self(),&ra,&rs,VM_REGION_BASIC_INFO_64,(vm_region_info_t)&ri,&rc,&ro)==KERN_SUCCESS){signal_hex("region=",ra);signal_hex("region size=",rs);signal_hex("region prot=",(uint64_t)ri.protection|((uint64_t)ri.max_protection<<8));}}signal_hex("pc=",pc);signal_hex("lr=",u->uc_mcontext->__ss.__lr);signal_hex("fp=",fp);
+ {uint64_t la=u->uc_mcontext->__ss.__lr;for(int k=0;k<2;k++){uint64_t a=k?la:pc;mach_vm_address_t r2=a;mach_vm_size_t s2=0;vm_region_basic_info_data_64_t i2;mach_msg_type_number_t c2=VM_REGION_BASIC_INFO_COUNT_64;mach_port_t o2=MACH_PORT_NULL;
+  if(k)write(2,"[totk] lr ",10);else write(2,"[totk] pc ",10);
+  if(mach_vm_region(mach_task_self(),&r2,&s2,VM_REGION_BASIC_INFO_64,(vm_region_info_t)&i2,&c2,&o2)==KERN_SUCCESS){signal_hex("in region=",r2);signal_hex(" size=",s2);signal_hex(" prot=",(uintptr_t)i2.protection|((uintptr_t)i2.max_protection<<8));signal_hex(" off=",a-r2);}
+  else write(2,"unmapped\n",9);}}
+  /* 诊断：TOTK_CRASH_PAUSE=<秒> 让进程崩溃后挂着，便于外部 vmmap / lldb 检查 */
+  /* Diagnostic: TOTK_CRASH_PAUSE=<seconds> keeps the process alive after the crash for external vmmap / lldb. */
+  {const char *ps=getenv("TOTK_CRASH_PAUSE");if(ps){int sec=atoi(ps);if(sec<=0)sec=300;fprintf(stderr,"[totk] crash pause %d s (pid %d)\n",sec,(int)getpid());sleep((unsigned)sec);}}
+  /* 诊断：列出所有 >1 MB 的可执行映射，用来认出 pc 落在哪一个 */
+  /* Diagnostic: list every executable mapping >1 MB, to identify which one pc falls in. */
+  {mach_vm_address_t a3=0;for(int n3=0;n3<4096;n3++){mach_vm_size_t s3=0;vm_region_submap_info_data_64_t i3;mach_msg_type_number_t c3=VM_REGION_SUBMAP_INFO_COUNT_64;natural_t d3=0;
+    if(mach_vm_region_recurse(mach_task_self(),&a3,&s3,&d3,(vm_region_recurse_info_t)&i3,&c3)!=KERN_SUCCESS)break;
+    if(i3.is_submap){a3++;continue;}
+    if((i3.protection&VM_PROT_EXECUTE)&&s3>=(1u<<20)){write(2,"[totk] X ",10);signal_hex("at=",a3);signal_hex(" size=",s3);signal_hex(" prot=",(uintptr_t)i3.protection);if(pc>=a3&&pc<a3+s3)write(2,"  <== pc\n",10);else write(2,"\n",2);}
+    a3+=s3;}}
  for(unsigned i=0;i<NM;i++)if(pc>=(uintptr_t)modules[i].base&&pc<(uintptr_t)modules[i].base+modules[i].size){write(2,modules[i].name,strlen(modules[i].name));signal_hex(" offset=",pc-(uintptr_t)modules[i].base);}
+ {int hit=0;for(unsigned i=0;i<NM;i++)if(pc>=(uintptr_t)modules[i].base&&pc<(uintptr_t)modules[i].base+modules[i].size)hit=1;
+  if(!hit)for(unsigned i=0;i<NM;i++){write(2,"[totk] no-module pc; ",21);write(2,modules[i].name,strlen(modules[i].name));signal_hex(" base=",(uintptr_t)modules[i].base);signal_hex(" end=",((uintptr_t)modules[i].base)+modules[i].size);}}
  for(unsigned i=0;i<29;i++)signal_hex("x=",u->uc_mcontext->__ss.__x[i]);signal_hex("sp=",u->uc_mcontext->__ss.__sp);
  for(unsigned depth=0;depth<24&&fp&&!(fp&15);depth++){uint64_t frame[2];mach_vm_size_t got=0;if(mach_vm_read_overwrite(mach_task_self(),fp,16,(uintptr_t)frame,&got)!=KERN_SUCCESS||got!=16)break;signal_hex("frame lr=",frame[1]);for(unsigned i=0;i<NM;i++)if(frame[1]>=(uintptr_t)modules[i].base&&frame[1]<(uintptr_t)modules[i].base+modules[i].size){write(2,modules[i].name,strlen(modules[i].name));signal_hex(" offset=",frame[1]-(uintptr_t)modules[i].base);}if(frame[0]==fp)break;fp=frame[0];   /* host-stack switch: frames may move between stacks */}
  /* TOTK_CRASH_MEM=<reg>[:<signed offset>[:<bytes>]]: dump words at register+offset; TOTK_CRASH_MEM_FOLLOW=k1,k2,...: for each
@@ -455,6 +471,13 @@ int main(int argc,char **argv) {
  runtime_hle_stack_init((uint64_t)runtime_keys[4]*8);
  need(pthread_key_create(&environment_key,environment_destroy)==0,"thread environment key");
  for(unsigned i=0;i<NM;i++)map_module(&modules[i],argv[1]);
+ /* 诊断（正常上下文，可靠）：列出所有 >1 MB 的可执行映射（含驱动 JIT 的代码段） */
+ /* Diagnostic (normal context, reliable): list every executable mapping >1 MB (driver-JIT code included). */
+ {mach_vm_address_t a9=0;mach_port_t o9=MACH_PORT_NULL;
+  for(int n9=0;n9<8192;n9++){mach_vm_size_t s9=0;vm_region_basic_info_data_64_t i9;mach_msg_type_number_t c9=VM_REGION_BASIC_INFO_COUNT_64;
+   if(mach_vm_region(mach_task_self(),&a9,&s9,VM_REGION_BASIC_INFO_64,(vm_region_info_t)&i9,&c9,&o9)!=KERN_SUCCESS)break;
+   if((i9.protection&VM_PROT_EXECUTE)&&s9>=(1u<<20))fprintf(stderr,"[totk] exec region at=%p size=%#zx prot=%#x\n",(void *)(uintptr_t)a9,(size_t)s9,(unsigned)i9.protection);
+   a9+=s9;}}
  for(unsigned i=0;i<NM;i++)relocate(&modules[i]);
  for(unsigned i=0;i<NM;i++)if(!strcmp(modules[i].name,"main"))runtime_game_patches(&modules[i]);
 #if !TARGET_OS_IPHONE

@@ -97,8 +97,12 @@ def prerequisites(args):
     if platform.system() != 'Darwin' or platform.machine() != 'arm64':
         raise BuildError('needs a Mac with Apple silicon')
     major = int(platform.mac_ver()[0].split('.')[0] or 0)
-    if major < 26:
-        raise BuildError(f'needs macOS 26 or later (Metal 4); this is macOS {platform.mac_ver()[0]}')
+    # TOTK_M3=1：Metal 3 版最低 macOS 15（图形后端不用 Metal 4）
+    # TOTK_M3=1: the Metal 3 build needs macOS 15 (the graphics backend does not use Metal 4)
+    m3 = os.environ.get('TOTK_M3', '') not in ('', '0')
+    need = 15 if m3 else 26
+    if major < need:
+        raise BuildError(f'needs macOS {need} or later ({"Metal 3" if m3 else "Metal 4"}); this is macOS {platform.mac_ver()[0]}')
     if subprocess.run(['xcrun', '--find', 'clang'], capture_output=True).returncode:
         raise BuildError('the Xcode command line tools are missing: xcode-select --install')
     brew = Path('/opt/homebrew')
@@ -521,8 +525,14 @@ def step_shaders(tree, logs, *, version='v0'):
 
 def step_binary(tree, game, keys, env, logs, *, version="v0"):
     say('4/4 app: building the game binary and the launcher')
-    run(['make', 'runtime' if version == 'v0' else f'runtime-{version}'], logs / 'runtime.log', cwd=tree, env=env)
-    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *([] if version == 'v0' else [f'-DTOTK_GAME_{version.upper()}=1']), 'app/launcher.m', '-framework', 'AppKit',
+    # TOTK_M3=1: macOS 15 / Metal 3 build (no Metal 4); otherwise the macOS 26 / Metal 4 build.
+    m3 = env.get('TOTK_M3', '') not in ('', '0')
+    target = ('runtime-m3' if m3 else 'runtime') if version == 'v0' else (f'runtime-{version}-m3' if m3 else f'runtime-{version}')
+    if m3:
+        env.setdefault('MACOS_MIN_M3', '15.0')
+        say(f'   Metal 3 build: minimum system macOS {env["MACOS_MIN_M3"]}, graphics backend without Metal 4')
+    run(['make', target], logs / 'runtime.log', cwd=tree, env=env)
+    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *([] if version == 'v0' else [f'-DTOTK_GAME_{version.upper()}=1']), *(['-mmacosx-version-min=' + env.get('MACOS_MIN_M3', '15.0')] if m3 else []), 'app/launcher.m', '-framework', 'AppKit', '-framework', 'GameController',
          '-o', 'build/app-launcher'], logs / 'launcher.log', cwd=tree, env=env)
     if not (tree / 'build/AppIcon.icns').exists():   # the game's own icon from its control data; optional
         try:
@@ -553,12 +563,16 @@ def sign_app(app, logs):
 
 
 def step_app(tree, out, logs, *, version="v0"):
+
     expected = VERSIONS[version]
+    m3 = os.environ.get('TOTK_M3', '') not in ('', '0')
     tmp = out.with_name(out.name + '.partial')
     if tmp.exists():
         shutil.rmtree(tmp)
     res = tmp / 'Contents/Resources/totk'
-    clone(tree / ('build/totk-native' if version == 'v0' else f'build/totk-native-{version}'), res/'build/totk-native')
+    game_bin = (('build/totk-native-m3' if version == 'v0' else f'build/totk-native-{version}-m3') if m3
+                else ('build/totk-native' if version == 'v0' else f'build/totk-native-{version}'))
+    clone(tree / game_bin, res/'build/totk-native')
     for rel in ('build/pso_manifest.tsv', 'build/spirv-cross/spirv-cross',
                 f'rewritten/{version}/main.patched.bin', f'rewritten/{version}/sdk.patched.bin',
                 f'rewritten/{version}/subsdk0.patched.bin', f'extracted/{version}/romfs/romfs.bin', f'extracted/{version}/romfs/runtime-index.bin'):
@@ -581,9 +595,13 @@ def step_app(tree, out, logs, *, version="v0"):
     clone(tree / 'build/app-launcher', tmp / 'Contents/MacOS/TOTK')
     info = dict(CFBundleDevelopmentRegion='en', CFBundleExecutable='TOTK', CFBundleIdentifier=BUNDLE_ID, CFBundleName=APP_NAME,
                 CFBundleDisplayName=APP_NAME, CFBundlePackageType='APPL', CFBundleShortVersionString=expected['display_version'],
-                CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion='26.0', NSHighResolutionCapable=True,
+                CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion=('15.0' if m3 else '26.0'), NSHighResolutionCapable=True,
                 LSApplicationCategoryType='public.app-category.action-games', LSSupportsGameMode=True,
-                GCSupportsControllerUserInteraction=True)
+                GCSupportsControllerUserInteraction=True,
+                # Wireless game controllers: GameController's discovery goes through Bluetooth; macOS 15 asks for the
+                # usage description when an app starts scanning. Keyboard input works without a controller either way.
+                NSBluetoothAlwaysUsageDescription='TOTK uses Bluetooth to discover and connect wireless game controllers.',
+                NSBluetoothPeripheralUsageDescription='TOTK uses Bluetooth to connect wireless game controllers.')
     icon = tree / 'build/AppIcon.icns'
     if icon.exists():
         clone(icon, tmp / 'Contents/Resources/AppIcon.icns')

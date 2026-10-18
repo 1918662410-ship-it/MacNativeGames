@@ -85,7 +85,7 @@ static int rx_setup(MTLPixelFormat fc, MTLPixelFormat fds) {
         dd.frontFaceStencil = sd; dd.backFaceStencil = sd; }
     g_rx_dss = [g_dev newDepthStencilStateWithDescriptor:dd];
     if (!g_rx_args) { MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 3; ad.maxBufferBindCount = 1;
-        g_rx_args = [g_dev newArgumentTableWithDescriptor:ad error:&e];
+        g_rx_args = [M3ArgTable new];
         for (int i = 0; i < 3; i++) { g_rx_const[i] = [g_dev newBufferWithLength:256 options:MTLResourceStorageModeShared]; res_add(g_rx_const[i]); } }
     if (!g_rx_args || !g_rx_dss) { MLOG("【红】运行时外推：参数表 / 深度状态建不出"); g_rx_pso1 = nil; failed = 1; return 0; }
     g_rx_fmt_c = fc; g_rx_fmt_ds = fds; MLOG("运行时外推：着色器建好（颜色格式 %lu，深度格式 %lu）", (unsigned long)fc, (unsigned long)fds);
@@ -148,9 +148,9 @@ int rt_ex_encode(id<MTLTexture> dst_hdr, id<MTLTexture> dst_ds, id<MTLTexture> s
     rp.depthAttachment.texture = dst_ds; rp.depthAttachment.loadAction = MTLLoadActionLoad; rp.depthAttachment.storeAction = MTLStoreActionStore;
     if (dst_ds.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) { rp.stencilAttachment.texture = dst_ds; rp.stencilAttachment.loadAction = MTLLoadActionLoad; rp.stencilAttachment.storeAction = MTLStoreActionStore; }
     id<MTL4RenderCommandEncoder> en = [g_cb renderCommandEncoderWithDescriptor:rp]; if (!en) return 0;
-    [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
-    [en setArgumentTable:g_rx_args atStages:MTLRenderStageFragment];
-    [g_rx_args setTexture:src_hdr.gpuResourceID atIndex:0]; [g_rx_args setTexture:src_ds.gpuResourceID atIndex:1]; [g_rx_args setTexture:g_rx_stv.gpuResourceID atIndex:2];
+    ((void)0);
+    m3_attach(g_rx_args, en, M3_STAGE_FRAGMENT);
+    [g_rx_args setTexture:src_hdr atIndex:0]; [g_rx_args setTexture:src_ds atIndex:1]; [g_rx_args setTexture:g_rx_stv atIndex:2];
     [g_rx_args setAddress:cbuf.gpuAddress atIndex:0];
     [en setViewport:(MTLViewport){0, 0, W, H, 0, 1}]; [en setRenderPipelineState:g_rx_pso1]; [en setDepthStencilState:g_rx_dss]; [en setStencilReferenceValue:0];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; m4_end(en);

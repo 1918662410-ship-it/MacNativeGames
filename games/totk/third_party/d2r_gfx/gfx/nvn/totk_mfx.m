@@ -23,6 +23,14 @@
 #include <string.h>
 #include "totk_mfx.h"
 
+#if !DM_NVN_M3
+/* 下面的实现用 MTL4FXFrameInterpolator；macOS 15 上连非 MTL4 的 MTLFXFrameInterpolator 都是
+   macos(26.0)，所以整个文件在 DM_NVN_M3 下换成文件末尾的桩：
+   帧生成关闭，回放层照常出画（只是没有补帧）。
+   The implementation below uses MTL4FXFrameInterpolator; on macOS 15 even the non-MTL4
+   MTLFXFrameInterpolator is macos(26.0), so under DM_NVN_M3 the whole file is replaced by the
+   stubs at the end: interpolation is off and the replay still presents (just without extra frames). */
+
 #define MLOG(...) do { fprintf(stderr, "[dm] [nvn-mtl] [mfx] " __VA_ARGS__); fputc('\n', stderr); } while (0)
 #define MDIE(...) do { MLOG("FATAL " __VA_ARGS__); abort(); } while (0)
 
@@ -384,3 +392,27 @@ void mfx_stats(char *out, size_t n) {
              (unsigned long long)g.miss[2], (unsigned long long)g.miss[3],
              (unsigned long long)g.skip_first, (unsigned long long)g.skip_cut, (unsigned long long)g.skip_busy);
 }
+
+#else /* DM_NVN_M3 — 帧生成在 macOS 15 上不存在：全部桩，模式恒为 off */
+
+int  mfx_enabled(void) { return 0; }   /* MFX_OFF：macOS 15 上补帧不可用 */
+const char *mfx_mode_name(int mode) { (void)mode; return "off"; }
+void mfx_set(int mode) { (void)mode; }
+int  mfx_latch(void) { return 0; }
+id<MTLTexture> mfx_scene_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h, MTLPixelFormat format) { (void)dev; (void)w; (void)h; (void)format; return nil; }
+id<MTLTexture> mfx_ui_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h) { (void)dev; (void)w; (void)h; return nil; }
+void mfx_note_scene(void) {}
+void mfx_note_depth(id<MTLTexture> depth) { (void)depth; }
+void mfx_note_camera(const float *cam, int n) { (void)cam; (void)n; }
+id<MTLResidencySet> mfx_residency(void) { return nil; }
+int  mfx_frame_prepare(double frame_s) { (void)frame_s; return -1; }
+void mfx_frame_encode(id<MTL4CommandBuffer> cb, int slot, id<MTL4CounterHeap> heap, NSUInteger stamp) { (void)cb; (void)slot; (void)heap; (void)stamp; }
+void mfx_note_gpu(double ms) { (void)ms; }
+void mfx_frame_abort(void) {}
+id<MTLTexture> mfx_output(int slot) { (void)slot; return nil; }
+void mfx_stats(char *out, size_t n) { if (out && n) snprintf(out, n, "off (macOS 15: no MetalFX frame interpolation)"); }
+void mfx_mv_log(void) {}
+int  mfx_dump_due(void) { return 0; }
+void mfx_dump(long frame, id<MTLTexture> swap_prev, id<MTLTexture> swap_cur) { (void)frame; (void)swap_prev; (void)swap_cur; }
+
+#endif /* DM_NVN_M3 */
