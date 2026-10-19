@@ -1,0 +1,7 @@
+build/
+DerivedData/
+*.xcuserstate
+Generated/*.bin
+Generated/*.metallib
+Resources/AppIcon.png
+Vendor/*.a

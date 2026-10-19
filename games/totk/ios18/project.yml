@@ -1,0 +1,71 @@
+name: TOTKiOS
+options:
+  bundleIdPrefix: com.zichen
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+    CLANG_ENABLE_OBJC_ARC: YES
+    CLANG_ENABLE_MODULES: YES
+targets:
+  TOTKRuntime:
+    type: library.static
+    platform: iOS
+    sources:
+      - path: ../runtime
+        excludes:
+          - frontend.m
+          - frontend_ios.m
+          - game_patches.c
+          - game_patches_v143.c
+          - probe*.c
+          - probes
+      - path: RuntimeOverlay/game_patches_v143_ios.c
+      - path: RuntimeOverlay/totk_shader_rt_ios.m
+      - path: RuntimeOverlay/frontend_ios_formal.m
+      - path: ../third_party/d2r_gfx/gfx/nvn
+        excludes:
+          - totk_shader_rt.m
+      - path: ../third_party/d2r_gfx/gfx/tex
+    settings:
+      base:
+        PRODUCT_NAME: TOTKRuntime
+        IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+        ARCHS: arm64
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CLANG_ENABLE_OBJC_ARC: YES
+        CLANG_ENABLE_MODULES: YES
+        USE_HEADERMAP: NO
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) DM_NVN_M3=1 TOTK_GAME_V143=1 main=totk_loader_main"
+        HEADER_SEARCH_PATHS: "$(inherited) $(SRCROOT)/Include $(SRCROOT)/../runtime $(SRCROOT)/../third_party/d2r_gfx/gfx/nvn $(SRCROOT)/../third_party/d2r_gfx/gfx/nvn/include $(SRCROOT)/../build/v143 $(SRCROOT)/../build $(SRCROOT)/Generated /opt/homebrew/opt/opus/include/opus /opt/homebrew/opt/libvpx/include"
+        OTHER_CFLAGS: "$(inherited) -Wno-deprecated-declarations -Wno-unused-function -Wno-unused-parameter -Wno-missing-field-initializers"
+  TOTK:
+    type: application
+    platform: iOS
+    sources:
+      - path: SourcesRuntime
+      - path: Generated/embed.S
+      - path: Resources
+    dependencies:
+      - target: TOTKRuntime
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zichen.totkios18runtime
+        PRODUCT_NAME: TOTK
+        INFOPLIST_FILE: InfoRuntime.plist
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1,2"
+        IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+        ARCHS: arm64
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CLANG_ENABLE_OBJC_ARC: YES
+        CLANG_ENABLE_MODULES: YES
+        USE_HEADERMAP: NO
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) DM_NVN_M3=1 TOTK_GAME_V143=1"
+        HEADER_SEARCH_PATHS: "$(inherited) $(SRCROOT)/Include $(SRCROOT)/../runtime $(SRCROOT)/../third_party/d2r_gfx/gfx/nvn $(SRCROOT)/../third_party/d2r_gfx/gfx/nvn/include $(SRCROOT)/../build/v143 $(SRCROOT)/../build $(SRCROOT)/Generated"
+        OTHER_LDFLAGS: "$(inherited) -Wl,-segprot,__TOTKX,r-x,r-x -Wl,-undefined,dynamic_lookup -framework UIKit -framework Metal -framework MetalFX -framework QuartzCore -framework Foundation -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -framework CoreVideo -framework AudioToolbox -framework AVFoundation -framework GameController -framework CoreHaptics -framework IOKit"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
