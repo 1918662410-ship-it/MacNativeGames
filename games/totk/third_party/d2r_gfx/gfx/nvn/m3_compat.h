@@ -90,7 +90,6 @@ typedef NSUInteger M3VisibilityOptions;
 // GPU address -> MTLBuffer registry: the replay layer holds GPU addresses, while the older API
 // binds by "buffer object + offset", so registered buffers are looked up by address range.
 // ---------------------------------------------------------------------------
-enum { M3_BUFS = 1024 };
 void m3_buf_add(id<MTLBuffer> b);
 void m3_buf_del(id<MTLBuffer> b);
 id<MTLBuffer> m3_buf(uint64_t gpu, NSUInteger *off);

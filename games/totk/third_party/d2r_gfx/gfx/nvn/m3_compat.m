@@ -5,30 +5,44 @@
 
 #import <os/lock.h>
 #import <string.h>
+#include <stdlib.h>
 
 // ---------------------------------------------------------------------------
 // GPU 地址 → MTLBuffer 反查表
 // ---------------------------------------------------------------------------
-static struct { uint64_t gpu, len; __unsafe_unretained id<MTLBuffer> buf; } g_m3_bufs[M3_BUFS];
-static int g_m3_nbufs;
+typedef struct { uint64_t gpu, len; __unsafe_unretained id<MTLBuffer> buf; } M3BufferEntry;
+static M3BufferEntry *g_m3_bufs;
+static NSUInteger g_m3_nbufs, g_m3_capacity;
 static os_unfair_lock g_m3_lk = OS_UNFAIR_LOCK_INIT;
 
 void m3_buf_add(id<MTLBuffer> b) {
     if (!b) return;
     os_unfair_lock_lock(&g_m3_lk);
-    if (g_m3_nbufs < M3_BUFS) {
-        g_m3_bufs[g_m3_nbufs].gpu = b.gpuAddress;
-        g_m3_bufs[g_m3_nbufs].len = b.length;
-        g_m3_bufs[g_m3_nbufs].buf = b;
-        g_m3_nbufs++;
+    for (NSUInteger i = 0; i < g_m3_nbufs; i++) {
+        if (g_m3_bufs[i].buf == b) {
+            os_unfair_lock_unlock(&g_m3_lk);
+            return;
+        }
     }
+    // Map/UI streaming can exceed 1024 live buffers. Never silently drop a registration.
+    if (g_m3_nbufs == g_m3_capacity) {
+        if (g_m3_capacity > SIZE_MAX / (2 * sizeof(M3BufferEntry))) abort();
+        NSUInteger capacity = g_m3_capacity ? g_m3_capacity * 2 : 1024;
+        M3BufferEntry *entries = realloc(g_m3_bufs, capacity * sizeof(*entries));
+        if (!entries) { fprintf(stderr, "[dm] [m3] GPU buffer registry allocation failed\n"); abort(); }
+        g_m3_bufs = entries;
+        if (g_m3_capacity) fprintf(stderr, "[dm] [m3] GPU buffer registry grew: %lu -> %lu\n",
+                                  (unsigned long)g_m3_capacity, (unsigned long)capacity);
+        g_m3_capacity = capacity;
+    }
+    g_m3_bufs[g_m3_nbufs++] = (M3BufferEntry){b.gpuAddress, b.length, b};
     os_unfair_lock_unlock(&g_m3_lk);
 }
 
 void m3_buf_del(id<MTLBuffer> b) {
     if (!b) return;
     os_unfair_lock_lock(&g_m3_lk);
-    for (int i = 0; i < g_m3_nbufs; i++)
+    for (NSUInteger i = 0; i < g_m3_nbufs; i++)
         if (g_m3_bufs[i].buf == b) { g_m3_bufs[i] = g_m3_bufs[--g_m3_nbufs]; break; }
     os_unfair_lock_unlock(&g_m3_lk);
 }
@@ -36,15 +50,15 @@ void m3_buf_del(id<MTLBuffer> b) {
 // 最近命中的那一项先试：同一通道里的绑定几乎都落在同一两个缓冲上
 // Try the most recently hit entry first: bindings within one pass almost always land on the same one or two buffers.
 id<MTLBuffer> m3_buf(uint64_t gpu, NSUInteger *off) {
-    static _Thread_local int last;
+    static _Thread_local NSUInteger last;
     id<MTLBuffer> r = nil;
     *off = 0;
     if (!gpu) return nil;
     os_unfair_lock_lock(&g_m3_lk);
-    int i = (last < g_m3_nbufs && gpu >= g_m3_bufs[last].gpu && gpu - g_m3_bufs[last].gpu < g_m3_bufs[last].len) ? last : -1;
-    for (int k = 0; i < 0 && k < g_m3_nbufs; k++)
+    NSUInteger i = (last < g_m3_nbufs && gpu >= g_m3_bufs[last].gpu && gpu - g_m3_bufs[last].gpu < g_m3_bufs[last].len) ? last : NSNotFound;
+    for (NSUInteger k = 0; i == NSNotFound && k < g_m3_nbufs; k++)
         if (gpu >= g_m3_bufs[k].gpu && gpu - g_m3_bufs[k].gpu < g_m3_bufs[k].len) i = k;
-    if (i >= 0) { last = i; r = g_m3_bufs[i].buf; *off = (NSUInteger)(gpu - g_m3_bufs[i].gpu); }
+    if (i != NSNotFound) { last = i; r = g_m3_bufs[i].buf; *off = (NSUInteger)(gpu - g_m3_bufs[i].gpu); }
     os_unfair_lock_unlock(&g_m3_lk);
     return r;
 }
