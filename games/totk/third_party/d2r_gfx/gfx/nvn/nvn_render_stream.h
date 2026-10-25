@@ -25,6 +25,9 @@ enum {
     RS_DRAW, RS_INSTANCED, RS_INDEXED, RS_STORE,
     RS_BEGIN,   /* u[0] = retained MTL4RenderPassDescriptor, u[1] = vertex table, u[2] = fragment table, u[3] = command buffer, u[4] = barrier at start, u[5] = visibility options */
     RS_END,     /* end the encoder (barrier at end if u[0], visibility options u[1]) */
+#if DM_NVN_M3
+    RS_USE_RESOURCE, /* retained resource, usage, stages; Metal 3 indirect hazard tracking */
+#endif
 };
 enum { RS_SPIN_NS = 200000 };   /* B waits (wfe) this long on an empty queue before sleeping on the semaphore. During a replay A never pauses
                                    for that long, so B sleeps in the frame gap and wakes (~30 us) at the next submission. The waits are wfe / sev,
@@ -90,6 +93,13 @@ static void rs_apply(id<MTL4RenderCommandEncoder> *enc, id<MTL4ArgumentTable> *v
         case RS_BLEND: { float v[4]; memcpy(v, u, sizeof v); [e setBlendColorRed:v[0] green:v[1] blue:v[2] alpha:v[3]]; break; }
         case RS_VISIBILITY: [e setVisibilityResultMode:(MTLVisibilityResultMode)u[0] offset:(NSUInteger)u[1]]; break;
         case RS_ADDRESS: [(u[0] ? *ft : *vt) setAddress:u[2] atIndex:(NSUInteger)u[1]]; break;
+#if DM_NVN_M3
+        case RS_USE_RESOURCE: {
+            id<MTLResource> resource = CFBridgingRelease((void *)(uintptr_t)u[0]);
+            [e useResource:resource usage:(MTLResourceUsage)u[1] stages:(MTLRenderStages)u[2]];
+            break;
+        }
+#endif
         case RS_DRAW: [e drawPrimitives:(MTLPrimitiveType)u[0] vertexStart:(NSUInteger)u[1] vertexCount:(NSUInteger)u[2]]; break;
         case RS_INSTANCED: [e drawPrimitives:(MTLPrimitiveType)u[0] vertexStart:(NSUInteger)u[1] vertexCount:(NSUInteger)u[2] instanceCount:(NSUInteger)u[3] baseInstance:(NSUInteger)u[4]]; break;
         case RS_INDEXED: m3_draw_indexed(e, (MTLPrimitiveType)u[0], (NSUInteger)u[1], (MTLIndexType)u[2], u[3], (NSUInteger)u[4], (NSUInteger)u[5], (NSInteger)u[6], (NSUInteger)u[7]); break;

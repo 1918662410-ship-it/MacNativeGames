@@ -34,6 +34,7 @@ static uint64_t g_gen_shown;            // interpolated frames handed to the scr
 #include "../tex/nvn_bcdec.h"
 
 #include "nvn_dirty.h"
+#include "nvn_depth_clear.h"
 #include "nvn_refl.h"
 #include "nvn_texture_plan.h"
 #include "fps_overlay.h"
@@ -4273,7 +4274,8 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
         if (pd.depthAttachment.texture) {
             any = 1;
             pd.depthAttachment.loadAction = R.clear_d ? MTLLoadActionClear : MTLLoadActionLoad;
-            pd.depthAttachment.clearDepth = R.cd; pd.depthAttachment.storeAction = MTLStoreActionStore;
+            pd.depthAttachment.clearDepth = pd.depthAttachment.texture.pixelFormat == MTLPixelFormatDepth16Unorm ? nvn_depth16_clear_value(R.cd) : R.cd;
+            pd.depthAttachment.storeAction = MTLStoreActionStore;
             MTLPixelFormat pf = pd.depthAttachment.texture.pixelFormat;
             if (clear_only != 4 && (pf == MTLPixelFormatDepth32Float_Stencil8 || pf == MTLPixelFormatStencil8)) {   // 4：只挂深度 | 4: depth only
                 pd.stencilAttachment.texture = pd.depthAttachment.texture; pd.stencilAttachment.level = pd.depthAttachment.level;
@@ -6504,6 +6506,25 @@ static int tex_slots_diagnostics(void) {
     if (active < 0) active = getenv("DM_NVN_TEXPNG_FS") != NULL || getenv("DM_NVN_FLASHHDR") != NULL;
     return active;
 }
+#if DM_NVN_M3
+static void m3_indirect_use(id en, id original, MTLResourceUsage usage, int nvn_stage, int metal_vertex, uint64_t gpu) {
+    id resource = original;
+    if (!resource || ![resource conformsToProtocol:@protocol(MTLResource)]) return; // samplers are not resources
+    if ([resource conformsToProtocol:@protocol(MTLBuffer)]) {
+        // Uniform snapshots/renames can point at an arena rather than the original pool.
+        NSUInteger offset;
+        id<MTLBuffer> actual = m3_buf(gpu, &offset);
+        if (actual) resource = actual;
+    }
+    if (nvn_stage == 5) [(id<MTLComputeCommandEncoder>)en useResource:resource usage:usage];
+    else {
+        MTLRenderStages stages = metal_vertex ? MTLRenderStageVertex : MTLRenderStageFragment;
+        if (rs_using(en)) rs_put((nvn_encode_packet){.op=RS_USE_RESOURCE,
+            .u={(uint64_t)(uintptr_t)CFBridgingRetain(resource),usage,stages}},0);
+        else [(id<MTLRenderCommandEncoder>)en useResource:resource usage:usage stages:stages];
+    }
+}
+#endif
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
     if (!sh->ae) return 1;
     if (nvn_stage == 1 && !strncmp(sh->key, "0ac9a54938974396", 16) && getenv("DM_NVN_FLASHHDR") && R.rt.n && R.rt.color[0])
@@ -6532,7 +6553,12 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             return 1;
         }
     }
+#if DM_NVN_M3
+    // Residency alone does not tell Metal 3 about reads/writes through argument buffers.
+    #define USE(r, u) do { id resource_ = (r); m3_indirect_use(en, resource_, (u), nvn_stage, metal_vertex, slots[aid]); if (__builtin_expect(g_res_check_on, 0)) res_check(resource_, sh->key, reg); } while (0)
+#else
     #define USE(r, u) do { (void)(u); if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)
+#endif
     // DM_NVN_PASSDUMP：每通道每阶段第一次新编时记着色器键（K）与各绑定的实际来源（B：UBO 地址 / 长度 / 前 4 个浮点，贴图号与序号或「哑」）
     // DM_NVN_PASSDUMP: on the first new encode per pass per stage, records the shader key (K) and the actual source of each binding (B: UBO address / length / first 4 floats, texture ID and serial, or 「哑」(dummy))
     static uint64_t bl_pass[6]; static int bl_all = -1; if (bl_all < 0) bl_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL || getenv("TOTK_INPUT_FILE") != NULL;   // 每次新编都记（否则只记每通道每阶段第一次） | Record on every new encode (otherwise only the first time per pass per stage)
@@ -9892,7 +9918,7 @@ static void clear_tex(const p_clear_tex *c) {
         MTLRenderPassAttachmentDescriptor *a = depth ? rp.depthAttachment : stencil ? rp.stencilAttachment : rp.colorAttachments[0];
         a.texture = t; a.level = lv; a.loadAction = MTLLoadActionClear; a.storeAction = MTLStoreActionStore;
         if (is3d) a.depthPlane = c->r.zoffset + z; else a.slice = l0 + c->r.zoffset + z;
-        if (depth) { rp.depthAttachment.clearDepth = c->c.f[0];
+        if (depth) { rp.depthAttachment.clearDepth = pf == MTLPixelFormatDepth16Unorm ? nvn_depth16_clear_value(c->c.f[0]) : c->c.f[0];
             if (stencil) { rp.stencilAttachment.texture = t; rp.stencilAttachment.level = lv; rp.stencilAttachment.slice = a.slice; rp.stencilAttachment.loadAction = MTLLoadActionClear;
                            rp.stencilAttachment.storeAction = MTLStoreActionStore; rp.stencilAttachment.clearStencil = c->c.u[1]; } }
         else if (stencil) rp.stencilAttachment.clearStencil = c->c.u[0];
