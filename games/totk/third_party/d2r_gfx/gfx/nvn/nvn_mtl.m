@@ -9690,10 +9690,22 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
     if ((uint32_t)(r->xoffset + r->width) > lw || (uint32_t)(r->yoffset + r->height) > lh || (is3d && (uint32_t)(r->zoffset + nz) > lz)) die("WriteTexels: region outside level %u", level);
     TILELOG(t, "WriteTexels lv%u xy=%d,%d %dx%d owned %d mirrored %d flags=%#x pbh=%d tileH=%u size=%llu", level, r->xoffset, r->yoffset, r->width, r->height, gpu_owned(t->serial), tex_mirrored(t), t->d.flags, t->d.pkg_block_h, t->L.tileH, (unsigned long long)t->L.size);
     if (tex_mirrored(t)) {
+        /* Only the written rectangle is laid out into the pool bytes. Converting the whole level both ways cost tens
+           of milliseconds per call on 16 MiB terrain textures while the calling guest thread kept its core, which
+           stalled the game's main thread for 100+ ms (TOTK_WRITE_TEXELS_FULL=1 restores the old round trip). */
+        static int full = -1; if (full < 0) { const char *e = getenv("TOTK_WRITE_TEXELS_FULL"); full = e && atoi(e); }
+        dm_guest_write_prepare(t->mem, t->L.size);
+        if (!full) {
+            (void)lz;
+            for (int z = 0; z < nz; z++) {
+                unsigned layer = is3d ? 0 : layer0 + r->zoffset + z;
+                if (nvn_swizzle_region(&t->d, level, layer, is3d ? (uint32_t)(r->zoffset + z) : 0, (uint32_t)x0, (uint32_t)y0, (uint32_t)wb, (uint32_t)hb, src + z * img, row, t->mem))
+                    die("WriteTexels: unsupported layout");
+            }
+        } else {
         size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;
         uint8_t *lin = malloc(lp * lr * lz);
         if (!lin) die("WriteTexels: out of memory");
-        dm_guest_write_prepare(t->mem, t->L.size);
         for (int z = 0; z < nz; z++) {
             unsigned layer = is3d ? 0 : layer0 + r->zoffset + z;
             if ((is3d && z == 0) || !is3d) if (nvn_deswizzle(&t->d, level, layer, t->mem, lin, lp)) die("WriteTexels: unsupported layout");
@@ -9702,6 +9714,7 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
             if (!is3d || z == nz - 1) if (nvn_swizzle(&t->d, level, layer, lin, lp, t->mem)) die("WriteTexels: unsupported layout");
         }
         free(lin);
+        }
         /* TOTK: a mirrored texture the GPU has rendered into is never re-uploaded from its pool bytes (tex_mtl), so the
            write goes into the MTLTexture as well (below); the pool bytes stay in step for texture objects created later. */
         if (!gpu_owned(t->serial)) return;

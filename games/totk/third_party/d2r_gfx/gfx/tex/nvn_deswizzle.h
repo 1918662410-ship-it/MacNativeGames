@@ -24,3 +24,7 @@ uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t row_bytes, u
 int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer,
                        uint32_t *row_bytes, uint32_t *rows, uint32_t *slices,
                        uint64_t *base, unsigned *tileH, unsigned *tileD, uint32_t *bpb);
+// Region write into storage without converting the whole level (x0 / width in bytes, y0 / height in block rows).
+int nvn_swizzle_region(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_t slice,
+                       uint32_t x0, uint32_t y0, uint32_t width, uint32_t height,
+                       const void *src, size_t src_pitch, void *dst);
