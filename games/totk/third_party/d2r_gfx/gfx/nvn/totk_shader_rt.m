@@ -25,7 +25,8 @@ int totk_depth_near_minus_w(void);   // hle_nvn.c: 1 when the game selected NVN_
 uint64_t dm_nvn_frame_count(void);
 
 extern char **environ;
-static pthread_mutex_t g_rt_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_rt_lock = PTHREAD_MUTEX_INITIALIZER;    // variant index
+static pthread_mutex_t g_svc_lock = PTHREAD_MUTEX_INITIALIZER;   // one translation at a time; taken without g_rt_lock held
 static NSMutableDictionary<NSString *, NSMutableArray<NSDictionary *> *> *g_variants;
 static NSMutableSet<NSString *> *g_msl_checked;
 static FILE *g_svc_in, *g_svc_out;
@@ -143,6 +144,26 @@ static int deps_match(NSDictionary *deps, NSDictionary *ans) {
     return 1;
 }
 
+/* Lookup only: the variant for these answers if it is already translated and usable, else nil. Never translates and
+   never waits for a translation in progress (the index lock is not held across the service round trip). */
+NSString *totk_rt_variant_cached(NSString *shader, NSDictionary *answers) {
+    NSString *result = nil;
+    pthread_mutex_lock(&g_rt_lock);
+    NSMutableArray *vs = variants_of(shader);
+    for (NSDictionary *v in vs) {
+        if (!deps_match(v[@"deps"], answers)) continue;
+        NSString *found = v[@"variant"];
+        if (!g_msl_checked) g_msl_checked = [NSMutableSet set];
+        if (![g_msl_checked containsObject:found]) {
+            NSString *msl = [NSString stringWithContentsOfFile:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.metal", found] encoding:NSUTF8StringEncoding error:nil];
+            if (!msl || [msl containsString:@"double "] || [msl containsString:@"unsupported_GLSLstd450"]) break;   // needs regeneration: the full path does it
+            [g_msl_checked addObject:found];
+        }
+        result = found; break;
+    }
+    pthread_mutex_unlock(&g_rt_lock);
+    return result;
+}
 NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, const uint8_t *code, NSDictionary *answers, NSArray *local) {
     uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     pthread_mutex_lock(&g_rt_lock);
@@ -164,6 +185,13 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
         pthread_mutex_unlock(&g_rt_lock);
         return found;
     }
+#if !TARGET_OS_IPHONE
+    /* Translate without the index lock, so lookups from the submit thread do not wait behind a background translation. */
+    pthread_mutex_unlock(&g_rt_lock);
+    pthread_mutex_lock(&g_svc_lock);
+    { NSString *again = totk_rt_variant_cached(shader, answers);   // another thread translated it meanwhile
+      if (again) { pthread_mutex_unlock(&g_svc_lock); return again; } }
+#endif
     uint32_t c1o, c1t; memcpy(&c1o, control + 0x700, 4); memcpy(&c1t, control + 0x704, 4);
     if (!c1t || c1t > 16u << 20 || c1o > c1t || (stage != 5 && c1o < 0x30)) die("shader %s: code area %#x / c1 %#x", shader.UTF8String, c1t, c1o);
     NSString *stage_name = stage == 0 ? @"vs" : stage == 1 ? @"ps" : stage == 5 ? @"cs" : nil;
@@ -211,7 +239,9 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
     NSData *jd = [NSData dataWithContentsOfFile:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.json", variant]];
     NSDictionary *refl = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
     if (![refl isKindOfClass:[NSDictionary class]]) die("shader %s: reflection missing", variant.UTF8String);
+    pthread_mutex_lock(&g_rt_lock);
     [vs addObject:@{@"variant": variant, @"deps": refl[@"deps"] ?: @{}}];
+    if (!g_msl_checked) g_msl_checked = [NSMutableSet set];
     [g_msl_checked addObject:variant];
     [[json_string(vs) dataUsingEncoding:NSUTF8StringEncoding] writeToFile:index_path(shader) atomically:YES];
     g_translated++;
@@ -222,6 +252,7 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
         [refl[@"softfloat64"] boolValue] ? " (FP64 fallback)" : "");
     if (g_translated <= 8 || g_translated % 100 == 0) LOG("[shader] translated %llu: %s %s", (unsigned long long)g_translated, stage_name.UTF8String, variant.UTF8String);
     pthread_mutex_unlock(&g_rt_lock);
+    pthread_mutex_unlock(&g_svc_lock);
     return variant;
 }
 

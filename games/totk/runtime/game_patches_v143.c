@@ -170,6 +170,18 @@ static void patch_output_res(Module *m){
     atomic_store((_Atomic uint64_t *)(void *)(output_page+40),0);
     fprintf(stderr,"[totk] 1.4.3 output: %ux%u swapchain; starts %s, key 3 cycles MetalFX / native / off; display-config veneer +%#llx\n",w,h,output_full_at_start?"at requested resolution":"at 1920x1080",(unsigned long long)stub);
 }
+/* Diagnostic live downscale. The startup overlay reserves the original size;
+   never grow beyond it. The game's existing display-config path rebuilds targets. */
+int runtime_output_res_height(unsigned h){
+    if(!output_page || !output_h || h<360 || h>output_h)return 0;
+    unsigned w=(unsigned)(((uint64_t)output_w*h/output_h)&~1ull);
+    if(w<640 || w>output_w)return 0;
+    atomic_store((_Atomic uint64_t *)(void *)(output_page+32),pack_size(w,h));
+    uint64_t config=atomic_load((_Atomic uint64_t *)(void *)(output_page+40));
+    if(config){__atomic_fetch_or((uint32_t *)(uintptr_t)(config+8),1u<<21,__ATOMIC_SEQ_CST);runtime_oe_push_message(30);}
+    fprintf(stderr,"[totk] live output requested %ux%u (startup maximum %ux%u)\n",w,h,output_w,output_h);
+    return 1;
+}
 int runtime_output_res_toggle(void){
     if(!output_page)return 0;
     _Atomic uint64_t *size=(_Atomic uint64_t *)(void *)(output_page+32);

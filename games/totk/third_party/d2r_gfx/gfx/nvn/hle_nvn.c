@@ -2242,7 +2242,7 @@ __attribute__((weak)) int dm_thermal_now(void) { return -1; }   // 缺省（Mac�
 // 长帧日志的逐帧环（GPU 时间滞后 8 帧才有，所以先存后判）
 // Per-frame ring for the long-frame log (GPU time only arrives 8 frames late, so store first and judge later)
 #define LFN 16
-typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms; unsigned pso, lib, up, rup; int ls; } lf_rec;   // ls：这一帧出图时读取画面是否盖着 | ls: whether the loading screen was covering the picture when this frame was presented
+typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms, acquire_ms, present_queue_ms, drawable_ms, submit_wall_ms, submit_cpu_ms, protect_ms; unsigned pso, lib, up, rup; int ls; } lf_rec;   // ls：这一帧出图时读取画面是否盖着 | ls: whether the loading screen was covering the picture when this frame was presented
 static lf_rec g_lf[LFN];
 __attribute__((weak)) void dm_longframe_note(const char *what) { LOG("[长帧] %s", what); }   // 缺省（图形单测）；宿主 diag.c 的强定义补上场景上下文并写 perf.txt | Default (graphics unit tests); the strong definition in the host's diag.c adds scene context and writes perf.txt
 extern void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns); extern uint64_t mtl_upload_bytes(void); extern void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
@@ -2553,7 +2553,72 @@ static void present_exec(win_t *o, int idx, double period, const int crop[4], ui
     if (frame) mtl_set_frame(frame);
     gfx_leave();
 }
+/* TOTK_HITCH_WATCH=<ms> (diagnostic, off by default): when the gap since the game's last present exceeds <ms>, log
+   the call stacks of the presenting thread (repeatedly, until it presents) and one snapshot of every other thread.
+   Threads are suspended only for the few microseconds a frame-pointer walk takes. */
+#include <dlfcn.h>
+static _Atomic uint64_t g_hw_last_ns, g_hw_frame;
+static _Atomic uint32_t g_hw_thread;
+static int g_hw_ms;
+static int hw_walk(thread_act_t th, uint64_t *pcs, int max) {
+    arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT; int n = 0;
+    if (thread_suspend(th) != KERN_SUCCESS) return 0;
+    if (thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
+        uint64_t fp = arm_thread_state64_get_fp(st);
+        pcs[n++] = arm_thread_state64_get_pc(st); if (n < max) pcs[n++] = arm_thread_state64_get_lr(st);
+        for (int i = 0; i < 48 && n < max && fp && !(fp & 7); i++) {
+            uint64_t f[2]; vm_size_t got = 0;
+            if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, 16, (vm_address_t)f, &got) != KERN_SUCCESS || got != 16) break;
+            if (f[1]) pcs[n++] = f[1];
+            if (f[0] <= fp) break; fp = f[0];
+        }
+    }
+    thread_resume(th);
+    return n;
+}
+static void hw_print(const char *tag, uint64_t frame, double gap_ms, uint32_t th, const uint64_t *pcs, int n) {
+    char line[2400]; size_t o = 0;
+    for (int i = 0; i < n && o < sizeof line - 96; i++) {
+        uint64_t pc = pcs[i] & 0x0000ffffffffffffull; Dl_info d = {0};   /* strip pointer-auth bits */
+        if (dladdr((void *)(uintptr_t)pc, &d) && d.dli_sname) o += (size_t)snprintf(line + o, sizeof line - o, " %s", d.dli_sname);
+        else o += (size_t)snprintf(line + o, sizeof line - o, " %#llx", (unsigned long long)pc);
+    }
+    LOG("[hitch-watch] %s frame %llu +%.0f ms thread %#x:%s", tag, (unsigned long long)frame, gap_ms, th, line);
+}
+static void *hw_main(void *unused) {
+    (void)unused; pthread_setname_np("totk-hitch-watch");
+    uint64_t reported = 0; int shots = 0;
+    for (;;) {
+        usleep(5000);
+        uint64_t last = atomic_load(&g_hw_last_ns), frame = atomic_load(&g_hw_frame); uint32_t th = atomic_load(&g_hw_thread);
+        if (!last || !th) continue;
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); double gap = (double)(now - last) / 1e6;
+        if (gap < g_hw_ms) continue;
+        if (reported != frame) { reported = frame; shots = 0;
+            thread_act_array_t list; mach_msg_type_number_t count = 0; thread_act_t self = mach_thread_self();
+            if (task_threads(mach_task_self(), &list, &count) == KERN_SUCCESS) {
+                for (mach_msg_type_number_t i = 0; i < count; i++) {
+                    if (list[i] != self && list[i] != th) { uint64_t pcs[10]; int n = hw_walk(list[i], pcs, 10); if (n) hw_print("other", frame, gap, list[i], pcs, n); }
+                    mach_port_deallocate(mach_task_self(), list[i]);
+                }
+                vm_deallocate(mach_task_self(), (vm_address_t)list, count * sizeof *list);
+            }
+            mach_port_deallocate(mach_task_self(), self);
+        }
+        if (shots < 24) { uint64_t pcs[40]; int n = hw_walk(th, pcs, 40); if (n) hw_print("game", frame, gap, th, pcs, n); shots++; usleep(10000); }
+    }
+    return NULL;
+}
+static void hw_present(uint64_t frame) {
+    static int init;
+    if (!init) { init = 1; const char *e = getenv("TOTK_HITCH_WATCH"); g_hw_ms = e ? atoi(e) : 0;
+        if (g_hw_ms > 0) { pthread_t t; pthread_create(&t, NULL, hw_main, NULL); pthread_detach(t); LOG("[hitch-watch] armed at %d ms", g_hw_ms); } }
+    if (g_hw_ms <= 0) return;
+    atomic_store(&g_hw_thread, (uint32_t)pthread_mach_thread_np(pthread_self()));
+    atomic_store(&g_hw_frame, frame); atomic_store(&g_hw_last_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+}
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
+    { static uint64_t hw_frames; hw_present(++hw_frames); }
     NVN_BLOCKING();
     (void)q; win_t *o = (win_t *)w; o->presents++;
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
@@ -2633,6 +2698,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         static uint64_t pfa, pre_; uint64_t fa_, pr_, up_, re_; nvn_dirty_stats(&fa_, &pr_); mtl_pkg_stats(&up_, &re_);
         trow(f, "@faults", (double)(fa_ - pfa)); trow(f, "@reuploads", (double)(re_ - pre_)); pfa = fa_; pre_ = re_;
         static uint64_t pmc, pmp, pmn; uint64_t mc_, mpg_, mn_; nvn_dirty_mp_stats(&mc_, &mpg_, &mn_);
+        double protect_ms = (mn_ - pmn) / 1e6;
         trow(f, "@mprotect_calls", (double)(mc_ - pmc)); trow(f, "@mprotect_pages", (double)(mpg_ - pmp)); trow(f, "@mprotect_ms", (mn_ - pmn) / 1e6); pmc = mc_; pmp = mpg_; pmn = mn_;
         double up_ms = mtl_upload_ns_take() / 1e6; trow(f, "@upload_ms", up_ms);
         trow(f, "@upload_gpu_ms", mtl_upload_gpu_ns_take() / 1e6);
@@ -2640,16 +2706,24 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         // Accounting: number of synchronous creations on the submit thread this frame + a timestamp on the same clock as UIMSG (offline, frames are split into front end / loading / in-run by the loading screen intervals)
         static uint64_t plib, ppso; uint64_t lib_, pso_; mtl_create_stats(&lib_, &pso_);
         trow(f, "@lib_new", (double)(lib_ - plib)); trow(f, "@pso_new", (double)(pso_ - ppso));
+        // Take destructive counters once. Share the exact frame's values with
+        // both the TSV and delayed long-frame log; never sample them eight frames later.
+        double drawable_ms = mtl_drawable_ns_take() / 1e6;
+        double submit_wall_ms = atomic_exchange(&g_sub_wall_ns, 0) / 1e6;
+        double submit_cpu_ms = atomic_exchange(&g_sub_cpu_ns, 0) / 1e6;
         {   // 长帧日志：本帧各项先记进环，等 8 帧后 GPU 时间到了再决定打不打（见下） | long-frame log: this frame's items are first recorded into the ring; whether to print is decided 8 frames later, once the GPU time has arrived (see below)
             static uint64_t plns, ppns, pup, prup, pub; uint64_t lns, pns, up, rup, ub; mtl_create_ns(&lns, &pns); mtl_pkg_stats(&up, &rup); ub = mtl_upload_bytes();
             lf_rec *r = &g_lf[f % LFN]; r->f = f; r->fr = fr; r->nv = nv; r->ls = g_nvn_loadscreen_up ? g_nvn_loadscreen_up() : 0; r->t_s = (now_ns() - g_t0_ns) / 1e9; r->pso = (unsigned)(pso_ - ppso); r->lib = (unsigned)(lib_ - plib);
             r->make_ms = ((lns - plns) + (pns - ppns)) / 1e6; r->up = (unsigned)(up - pup); r->rup = (unsigned)(rup - prup); r->up_mb = (ub - pub) / 1048576.0; r->up_ms = up_ms;
+            r->acquire_ms = g_acq_wait_ns / 1e6; r->present_queue_ms = g_pq_wait_ns / 1e6;
+            r->drawable_ms = drawable_ms; r->submit_wall_ms = submit_wall_ms;
+            r->submit_cpu_ms = submit_cpu_ms; r->protect_ms = protect_ms;
             plns = lns; ppns = pns; pup = up; prup = rup; pub = ub;
         }
         plib = lib_; ppso = pso_;
         trow(f, "@t_s", (now_ns() - g_t0_ns) / 1e9);
-        trow(f, "@drawable_ms", mtl_drawable_ns_take() / 1e6);
-        trow(f, "@sub_wall_ms", atomic_exchange(&g_sub_wall_ns, 0) / 1e6); trow(f, "@sub_cpu_ms", atomic_exchange(&g_sub_cpu_ns, 0) / 1e6); trow(f, "@sub_instr", (double)atomic_exchange(&g_sub_instr, 0));
+        trow(f, "@drawable_ms", drawable_ms);
+        trow(f, "@sub_wall_ms", submit_wall_ms); trow(f, "@sub_cpu_ms", submit_cpu_ms); trow(f, "@sub_instr", (double)atomic_exchange(&g_sub_instr, 0));
     } else atomic_store(&g_nvn_ns, 0);
     g_acq_wait_ns = g_pq_wait_ns = 0;
     if (f >= 8) { double g = mtl_gpu_ms(f - 8); if (g >= 0) { tpush(3, g); trow(f - 8, "@gpu_ms", g); g_hr[g_hn++ % HRN] = g; }   // GPU 时间滞后 8 帧取（已完成） | GPU time is taken 8 frames late (already completed)
@@ -2659,9 +2733,14 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
           // "Long" is relative to recent conditions: when running steadily at 30 fps (menus / windowless host) or under sustained overload, every frame is > 20 ms; those are not long frames and must not flood the log - a frame has to be 40% above the sliding mean of the last 16 frames to count
           static double ef = 16.7, eg = 8; int lf = r->fr > 20.0 && r->fr > 1.4 * ef, lg = g > 16.7 && g > 1.3 * eg;
           if (r->f == f - 8) { ef += ((r->fr < 3 * ef ? r->fr : 3 * ef) - ef) / 16; eg += ((g < 3 * eg ? g : 3 * eg) - eg) / 16; }
-          if (on && r->f == f - 8 && f - 8 > 0 && (lf || lg)) { char b[512];
+          if (on && r->f == f - 8 && f - 8 > 0 && (lf || lg)) { char b[1024];
               snprintf(b, sizeof b, "帧 %llu（%.2f s）整帧 %.1f ms，提交+出图 %.1f ms，GPU %.1f ms；新建管线 %u 条 + 着色器库 %u 个共 %.1f ms；上传贴图 首传 %u 张 + 重传 %u 次 %.1f MB / %.1f ms",
                        (unsigned long long)r->f, r->t_s, r->fr, r->nv, g, r->pso, r->lib, r->make_ms, r->up, r->rup, r->up_mb, r->up_ms);
+              size_t detail_offset = strlen(b);
+              snprintf(b + detail_offset, sizeof b - detail_offset,
+                       "；取图等待 %.1f ms，出图队列等待 %.1f ms，drawable %.1f ms；提交 wall/CPU %.1f/%.1f ms，写保护 %.1f ms",
+                       r->acquire_ms, r->present_queue_ms, r->drawable_ms,
+                       r->submit_wall_ms, r->submit_cpu_ms, r->protect_ms);
               // 可见性：长帧「晚出来」的那段时间屏幕上停着的是上一帧；上一帧若是读取画面（或本帧自己就是），玩家看到的只是读取画面多停了一下，没有运动被打断
               // Visibility: during the time a long frame "comes out late", what stays on screen is the previous frame; if the previous frame was a loading screen (or this frame itself is one), all the player sees is the loading screen staying a bit longer, with no motion interrupted
               const lf_rec *pv = &g_lf[(f - 9) % LFN]; int hidden = r->ls || (f >= 9 && pv->f == f - 9 && pv->ls);

@@ -1,3 +1,4 @@
+#include "../third_party/d2r_gfx/gfx/nvn/m3_device.h"
 /* Native macOS window and VI service adapter. No guest frame is synthesized. */
 #import <Cocoa/Cocoa.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -8,6 +9,7 @@
 #include <math.h>
 #include "runtime.h"
 #include "game_version.h"
+#include "mouse_look.h"
 static NSWindow *window;
 uint64_t dm_nvn_frame_count(void);   /* gfx/nvn/hle_nvn.c: game frames presented so far */
 static CAMetalLayer *metalLayer;
@@ -88,12 +90,38 @@ static CVReturn vsync_callback(CVDisplayLinkRef link,const CVTimeStamp *now,cons
 - (BOOL)canBecomeKeyWindow { return YES; }
 - (BOOL)canBecomeMainWindow { return YES; }
 @end
+/* Mainline capture policy adapted to the older frontend. Key 7 toggles capture. */
+static BOOL mouseHeld,textEntryOpen;
+static dispatch_source_t mouseTimer;
+static void front_mouse_capture(BOOL on){
+ BOOL want=on&&window.isKeyWindow&&!textEntryOpen;
+ if(want==mouseHeld)return;
+ if(want){
+  NSRect f=[window convertRectToScreen:window.contentView.frame];CGFloat top=NSMaxY(NSScreen.screens.firstObject.frame);
+  CGWarpMouseCursorPosition(CGPointMake(NSMidX(f),top-NSMidY(f)));
+  if(CGAssociateMouseAndMouseCursorPosition(false)!=kCGErrorSuccess){fprintf(stderr,"[mouse] capture failed\n");return;}
+  [NSCursor hide];
+ }else{CGAssociateMouseAndMouseCursorPosition(true);[NSCursor unhide];}
+ mouseHeld=want;window.acceptsMouseMovedEvents=want;runtime_mouse_capture(want);
+ fprintf(stderr,"[mouse] %s; key 7 toggles, Command-Tab releases\n",want?"held":"released");
+}
 @interface TOTKInputView:NSView
 @end
 @implementation TOTKInputView
 -(BOOL)acceptsFirstResponder{return YES;}
--(void)keyDown:(NSEvent *)e{runtime_input_key(e.keyCode,1);}
--(void)keyUp:(NSEvent *)e{runtime_input_key(e.keyCode,0);}
+-(void)keyDown:(NSEvent *)e{if(e.keyCode==26){if(!e.isARepeat)front_mouse_capture(!mouseHeld);return;}if(e.keyCode==53&&!e.isARepeat)front_mouse_capture(NO);runtime_input_key(e.keyCode,1);}
+-(void)keyUp:(NSEvent *)e{if(e.keyCode!=26)runtime_input_key(e.keyCode,0);}
+-(BOOL)acceptsFirstMouse:(NSEvent *)e{(void)e;return YES;}
+-(void)mouseMoved:(NSEvent *)e{if(mouseHeld)runtime_mouse_move(e.deltaX,e.deltaY);}
+-(void)mouseDragged:(NSEvent *)e{[self mouseMoved:e];}
+-(void)rightMouseDragged:(NSEvent *)e{[self mouseMoved:e];}
+-(void)otherMouseDragged:(NSEvent *)e{[self mouseMoved:e];}
+-(void)mouseDown:(NSEvent *)e{(void)e;if(mouseHeld)runtime_mouse_button(0,1);else front_mouse_capture(YES);}
+-(void)mouseUp:(NSEvent *)e{(void)e;if(mouseHeld)runtime_mouse_button(0,0);}
+-(void)rightMouseDown:(NSEvent *)e{(void)e;if(mouseHeld)runtime_mouse_button(1,1);}
+-(void)rightMouseUp:(NSEvent *)e{(void)e;if(mouseHeld)runtime_mouse_button(1,0);}
+-(void)otherMouseDown:(NSEvent *)e{if(mouseHeld)runtime_mouse_button((unsigned)e.buttonNumber,1);}
+-(void)otherMouseUp:(NSEvent *)e{if(mouseHeld)runtime_mouse_button((unsigned)e.buttonNumber,0);}
 -(void)flagsChanged:(NSEvent *)e{if(e.keyCode==56)runtime_input_key(56,!!(e.modifierFlags&NSEventModifierFlagShift));if(e.keyCode==58)runtime_input_key(58,!!(e.modifierFlags&NSEventModifierFlagOption));}
 @end
 /* The drawable follows the window's pixel size; the present pass scales the game picture (1920x1080 docked) into it and
@@ -114,10 +142,10 @@ static void front_sync_drawable(void){
 @end
 @implementation TOTKWindowDelegate
 -(void)windowDidBecomeKey:(NSNotification *)n{(void)n;atomic_store(&focused,1);runtime_oe_push_message(15);fprintf(stderr,"[totk] window gained focus\n");}
--(void)windowDidResignKey:(NSNotification *)n{(void)n;atomic_store(&focused,0);runtime_input_clear();runtime_oe_push_message(15);fprintf(stderr,"[totk] window lost focus\n");}
+-(void)windowDidResignKey:(NSNotification *)n{(void)n;atomic_store(&focused,0);front_mouse_capture(NO);runtime_input_clear();runtime_oe_push_message(15);fprintf(stderr,"[totk] window lost focus\n");}
 /* The process ends with the window. Save writes go straight to the files (runtime/fs_host.c), so a close in the middle of a
    save waits (up to 15 s, the window already gone) until the game has written and committed it (runtime_fs_save_busy). */
--(void)windowWillClose:(NSNotification *)n{(void)n;
+-(void)windowWillClose:(NSNotification *)n{(void)n;front_mouse_capture(NO);
  if(!runtime_fs_save_busy()){fprintf(stderr,"[totk] window closed; graceful guest shutdown pending\n");_exit(0);}
  fprintf(stderr,"[totk] window closed while the game is saving: quitting when the save is done\n");
  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
@@ -156,6 +184,7 @@ void runtime_front_run(void(*callback)(void)){
   if (true_full) { ww=display.size.width; wh=display.size.height; }
   else { CGFloat k=fmin(1,fmin(vis.size.width/ww,(vis.size.height-28)/wh));ww=floor(ww*k);wh=floor(wh*k); }
   window=[[TOTKGameWindow alloc] initWithContentRect:(true_full?display:NSMakeRect(0,0,ww,wh)) styleMask:(true_full?NSWindowStyleMaskBorderless:(NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskResizable)) backing:NSBackingStoreBuffered defer:NO];
+  if(!true_full)window.contentAspectRatio=NSMakeSize(ww,wh);
   window.releasedWhenClosed=NO;   /* a close that waits for a save (windowWillClose) must not free the window the static pointer still holds */
   /* An agent's test game (TOTK_SLOT_OWNER other than user) says so in its title: it plays a save copy and its script closes it. */
   const char *owner=getenv("TOTK_SLOT_OWNER"),*purpose=getenv("TOTK_SLOT_PURPOSE");
@@ -165,7 +194,13 @@ void runtime_front_run(void(*callback)(void)){
   else window.collectionBehavior|=NSWindowCollectionBehaviorFullScreenPrimary;
   window.backgroundColor=[NSColor blackColor];   /* 窗口/图层默认白底会在 drawable 未呈现时闪一下；黑底不透明，激活/遮挡回来不再白闪 */
   window.contentView=[[TOTKInputView alloc] initWithFrame:NSMakeRect(0,0,ww,wh)];
-  metalLayer=[CAMetalLayer layer];metalLayer.device=MTLCreateSystemDefaultDevice();metalLayer.pixelFormat=MTLPixelFormatBGRA8Unorm;metalLayer.drawableSize=CGSizeMake(ww,wh);
+  metalLayer=[CAMetalLayer layer];
+#if DM_NVN_M3
+metalLayer.device=m3_default_device();
+#else
+metalLayer.device=MTLCreateSystemDefaultDevice();
+#endif
+metalLayer.pixelFormat=MTLPixelFormatBGRA8Unorm;metalLayer.drawableSize=CGSizeMake(ww,wh);
   metalLayer.opaque=YES;metalLayer.backgroundColor=[NSColor blackColor].CGColor;
   metalLayer.framebufferOnly=NO;window.contentView.wantsLayer=YES;window.contentView.layer=metalLayer;
   bootOverlay=[[NSView alloc] initWithFrame:window.contentView.bounds];bootOverlay.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;
@@ -191,6 +226,10 @@ void runtime_front_run(void(*callback)(void)){
   atomic_store(&focused,1);
   if(CVDisplayLinkCreateWithActiveCGDisplays(&displayLink)||CVDisplayLinkSetOutputCallback(displayLink,vsync_callback,NULL)||CVDisplayLinkStart(displayLink))runtime_fail("native display link initialization");
   pthread_t guest;pthread_attr_t attr;pthread_attr_init(&attr);pthread_attr_setstacksize(&attr,8*1024*1024);int err=pthread_create(&guest,&attr,guest_main,(void *)callback);pthread_attr_destroy(&attr);if(err)runtime_fail("native game thread creation");
+  mouseTimer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_queue_create("totk.mouse",DISPATCH_QUEUE_SERIAL));
+  dispatch_source_set_timer(mouseTimer,dispatch_time(DISPATCH_TIME_NOW,MOUSE_LOOK_TICK_NS),MOUSE_LOOK_TICK_NS,1000000);
+  dispatch_source_set_event_handler(mouseTimer,^{runtime_mouse_tick();});dispatch_resume(mouseTimer);
+  fprintf(stderr,"[mouse] ready: click picture or press 7 to capture; 7 / Command-Tab releases\n");
   [NSApp run];runtime_fail("native event loop returned unexpectedly");
  }
 }
@@ -255,6 +294,7 @@ int runtime_front_text_input(const RuntimeTextRequest *req,char *out,size_t out_
  int maxU=req->max_units,minU=req->min_units,digits=req->digits_only,secure=req->secure;uint32_t dis=req->disabled;
  __block NSString *result=nil;dispatch_semaphore_t sem=dispatch_semaphore_create(0);
  dispatch_async(dispatch_get_main_queue(), ^{
+  textEntryOpen=YES;front_mouse_capture(NO);
   NSView *cv=window.contentView;CGFloat w=fmin(720,cv.bounds.size.width-40),h=104;
   TOTKTextBar *bar=[[TOTKTextBar alloc] initWithFrame:NSMakeRect(floor((cv.bounds.size.width-w)/2),48,w,h)];
   bar.autoresizingMask=NSViewMinXMargin|NSViewMaxXMargin|NSViewMaxYMargin;bar.wantsLayer=YES;bar.layer.cornerRadius=12;
@@ -269,7 +309,7 @@ int runtime_front_text_input(const RuntimeTextRequest *req,char *out,size_t out_
   NSTextField *field=secure?[[NSSecureTextField alloc] initWithFrame:NSMakeRect(18,16,w-36,34)]:[[NSTextField alloc] initWithFrame:NSMakeRect(18,16,w-36,34)];
   field.font=[NSFont systemFontOfSize:20];field.stringValue=initial;field.delegate=bar;field.bezelStyle=NSTextFieldRoundedBezel;bar.field=field;
   __weak TOTKTextBar *weakBar=bar;
-  bar.done=^(NSString *text){result=[text copy];[weakBar removeFromSuperview];[window makeFirstResponder:window.contentView];dispatch_semaphore_signal(sem);};
+  bar.done=^(NSString *text){textEntryOpen=NO;result=[text copy];[weakBar removeFromSuperview];[window makeFirstResponder:window.contentView];dispatch_semaphore_signal(sem);};
   [bar addSubview:label];[bar addSubview:hint];[bar addSubview:field];[cv addSubview:bar];openBar=bar;
   runtime_input_clear();
   if(window.miniaturized)[window deminiaturize:nil];

@@ -137,3 +137,13 @@ void runtime_feedback_quiet(void);   /* focus lost: stop rumbling */
 void runtime_feedback_attach(GCController *controller);
 void runtime_feedback_detach(GCController *controller);
 #endif
+
+/* macOS 13 backport of mainline mouse panning; frontend owns capture. */
+void runtime_mouse_capture(int on);
+void runtime_mouse_move(double dx,double dy);
+void runtime_mouse_button(unsigned button,int down);
+void runtime_mouse_tick(void);
+void runtime_motion_mouse(int on);
+void runtime_motion_feed_mouse(const double acc[3],const double gyro[3],uint64_t now);
+
+uint64_t runtime_gamepad_held_buttons(void);

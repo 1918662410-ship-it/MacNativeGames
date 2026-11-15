@@ -97,7 +97,11 @@ static int shared_objects(id<MTLDevice> dev) {
     int ok = 1; NSError *e = nil;
     if (!g_dev) g_dev = dev;
     if (g_dev != dev) { ULOG("textures of another device: game's own upscale stays"); ok = 0; }
+#if DM_NVN_M3
+    if (ok && !g_rs) g_rs = [M3ResidencySet new];
+#else
     if (ok && !g_rs) { g_rs = [g_dev newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:&e]; if (!g_rs) { ULOG("residency set: %s", e.localizedDescription.UTF8String); ok = 0; } }
+#endif
     #if DM_NVN_M3
     /* macOS 15 走经典 MTLFXSpatialScaler（macOS 13 起）：不需要 MTL4 编译器，能力判定用 supportsDevice:
        macOS 15 takes the classic MTLFXSpatialScaler (macOS 13+): no MTL4 compiler, capability via supportsDevice: */

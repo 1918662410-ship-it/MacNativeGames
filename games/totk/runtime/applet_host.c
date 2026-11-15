@@ -44,6 +44,7 @@ static unsigned char try_pop(uint32_t *out) {
 int runtime_core_away(void); void runtime_core_back(int *away);
 static uint32_t pop(void) {
     __attribute__((cleanup(runtime_core_back))) int away = runtime_core_away();   /* blocks like a Horizon wait */
+    (void)away; /* Older Clang does not count the cleanup callback as a use. */
     pthread_mutex_lock(&lock); while (head == tail) pthread_cond_wait(&message_cv, &lock);
     uint32_t m = messages[head++ % 32]; pthread_mutex_unlock(&lock); return m;
 }

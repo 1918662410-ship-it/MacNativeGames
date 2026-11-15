@@ -22,7 +22,33 @@
 #if DM_NVN_M3
 
 #import <Metal/Metal.h>
+#import "m3_device.h"
 #import <Foundation/Foundation.h>
+
+// Metal 3 uses per-encoder resource declarations, not residency sets.
+// Keep strong ownership until the caller's existing GPU retirement releases each resource.
+#define MTLResidencySet M3ResidencySet
+#define MTLAllocation MTLResource
+@protocol M3ResidencySet <NSObject>
+- (void)addAllocation:(id<MTLResource>)resource;
+- (void)removeAllocation:(id<MTLResource>)resource;
+- (void)commit;
+@end
+@interface M3ResidencySet : NSObject <M3ResidencySet>
+@end
+void m3_use_resident_resources(id encoder);
+void m3_encoder_full_buffers(id encoder);
+int m3_selective_compute_enabled(void);
+void m3_selective_compute_set(int on);
+void m3_encoder_compute_selective(id encoder);
+void m3_use_compute_resource(id encoder, id<MTLResource> resource, MTLResourceUsage usage);
+void m3_use_compute_buffer(id encoder, id<MTLResource> buffer, MTLResourceUsage usage);
+
+int m3_selective_textures_enabled(void);
+void m3_selective_textures_set(int on);
+void m3_selective_buffers_set(int on);
+void m3_encoder_selective(id encoder);
+id m3_encoder_begin(id encoder); // reset even when Metal recycles an encoder object
 
 // ---------------------------------------------------------------------------
 // 类型映射
@@ -90,7 +116,7 @@ typedef NSUInteger M3VisibilityOptions;
 // GPU address -> MTLBuffer registry: the replay layer holds GPU addresses, while the older API
 // binds by "buffer object + offset", so registered buffers are looked up by address range.
 // ---------------------------------------------------------------------------
-enum { M3_BUFS = 1024 };
+enum { M3_INITIAL_BUF_CAPACITY = 1024 }; // grows; never silently drop registered buffers
 void m3_buf_add(id<MTLBuffer> b);
 void m3_buf_del(id<MTLBuffer> b);
 id<MTLBuffer> m3_buf(uint64_t gpu, NSUInteger *off);
@@ -122,6 +148,9 @@ enum { M3_STAGE_VERTEX = 0, M3_STAGE_FRAGMENT = 1, M3_STAGE_COMPUTE = 2 };
 // 挂载：替代 `[enc setArgumentTable:t]` 与 `[enc setArgumentTable:t atStages:s]`
 // Attach: replaces `[enc setArgumentTable:t]` and `[enc setArgumentTable:t atStages:s]`.
 void m3_attach(M3ArgTable *t, id enc, int stage);
+// Dedicated helper encoders only: all resources must be directly bound through
+// Metal setters. Never use this for shaders containing indirect GPU pointers.
+void m3_encoder_direct_resources(id encoder);
 
 // ---------------------------------------------------------------------------
 // GPU 时间戳：MTL4CounterHeap → MTLCounterSampleBuffer
@@ -209,4 +238,10 @@ void m3_commit(id<MTLCommandBuffer> cb, M3CommitOptions *o);
 - (instancetype)initWithDevice:(id<MTLDevice>)dev;
 @end
 
+#else
+static inline int m3_selective_textures_enabled(void) { return 0; }
+static inline void m3_selective_textures_set(int on) { (void)on; }
+static inline void m3_selective_buffers_set(int on) { (void)on; }
+static inline void m3_encoder_selective(id encoder) { (void)encoder; }
+static inline id m3_encoder_begin(id encoder) { return encoder; }
 #endif /* DM_NVN_M3 */
