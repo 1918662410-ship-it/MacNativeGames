@@ -1,6 +1,10 @@
 /* Native keyboard and macOS gamepad backed full-key controller. State ABI follows libnx HID. */
 #include "runtime.h"
 #include "autoload.h"
+#include "mouse_look.h"
+#include "bow_state.h"
+#include <mach/mach.h>
+#include "mach_vm_compat.h"
 #include "world_survey.h"
 #include <stdbool.h>
 #include <stdio.h>
@@ -11,6 +15,52 @@ typedef struct{int64_t sampling;uint64_t buttons;int32_t lx,ly,rx,ry;uint32_t at
 _Static_assert(sizeof(NpadState)==40,"Npad full-key ABI");
 static pthread_mutex_t inputLock=PTHREAD_MUTEX_INITIALIZER;
 static unsigned char keys[128];static uint64_t pending;
+static uint64_t nativeButtons[128]; /* physical keys with PC bindings; scripted keys retain their ABI */
+static MouseLook mouseLook;
+static MouseLookSettings mouseSettings;
+static int mouseCaptured,mouseGyro;
+static unsigned mouseButtons;
+static uint64_t mousePending;
+static int32_t mouseRX,mouseRY;
+static void user_input(const char *what);
+static uint64_t mouse_buttons(void){
+ uint64_t b=0;
+ /* While drawing, left click releases ZR to shoot, without swinging the sword. */
+ if(mouseButtons&2){if(!(mouseButtons&1))b|=512;}
+ else if(mouseButtons&1)b|=8;
+ if(mouseButtons&4)b|=256;
+ return b;
+}
+void runtime_mouse_capture(int on){
+ pthread_mutex_lock(&inputLock);
+ mouseCaptured=!!on;mouseButtons=0;mousePending=0;mouseRX=mouseRY=0;mouse_look_reset(&mouseLook);
+ mouseSettings=mouse_look_settings(getenv("TOTK_MOUSE_SENSITIVITY"),getenv("TOTK_MOUSE_INVERT_Y"),getenv("TOTK_MOUSE_COUNTERWEIGHT"),getenv("TOTK_MOUSE_DECAY"),getenv("TOTK_MOUSE_MIN_DECAY"));
+ mouseGyro=on&&(!getenv("TOTK_MOUSE_GYRO")||atoi(getenv("TOTK_MOUSE_GYRO")));
+ runtime_motion_mouse(mouseGyro);
+ pthread_mutex_unlock(&inputLock);
+ fprintf(stderr,"[mouse] capture=%d sensitivity=%d gyro=%d\n",on,mouseSettings.sensitivity,mouseGyro);
+}
+void runtime_mouse_move(double dx,double dy){
+ if(!isfinite(dx)||!isfinite(dy))return;
+ pthread_mutex_lock(&inputLock);
+ if(mouseCaptured){mouse_look_point(&mouseLook,keys[12]||!!(runtime_gamepad_held_buttons()&64));mouse_look_move(&mouseLook,dx,dy,&mouseSettings);if(dx||dy)user_input("mouse");}
+ pthread_mutex_unlock(&inputLock);
+}
+void runtime_mouse_button(unsigned b,int down){
+ if(b>2)return;
+ pthread_mutex_lock(&inputLock);
+ if(mouseCaptured){uint64_t before=mouse_buttons();if(down)mouseButtons|=1u<<b;else mouseButtons&=~(1u<<b);mousePending|=mouse_buttons()&~before;if(down)user_input("mouse button");}
+ pthread_mutex_unlock(&inputLock);
+}
+void runtime_mouse_tick(void){
+ pthread_mutex_lock(&inputLock);
+ if(mouseCaptured){
+  mouse_look_point(&mouseLook,keys[12]||!!(runtime_gamepad_held_buttons()&64));
+  double gyro[3],acc[3];mouse_look_tick(&mouseLook,&mouseSettings,&mouseRX,&mouseRY,gyro,acc);
+  if(mouseGyro)runtime_motion_feed_mouse(acc,gyro,runtime_now_ns());
+ }
+ pthread_mutex_unlock(&inputLock);
+}
 static uint32_t styles=1;static bool enabled,allowed=true;static int holdType;
 static int64_t sample;static uint64_t padSeen;
 /* F/T/H/G map the D-pad left/up/right/down, keeping both analog-stick mappings independent. */
@@ -39,8 +89,40 @@ void runtime_input_key_synthetic(unsigned code,int down){if(code>=128)return;pth
  if(press&&code==KEY_OUTPUT_MODE_CYCLE)runtime_output_mode_cycle();
  if(press&&code==KEY_OVERLAY_TOGGLE){extern void dm_gfx_set_flag(const char *name,int v);dm_gfx_set_flag("overlays",-1);}
 }
-void runtime_input_key(unsigned code,int down){if(down&&code<128)user_input("keyboard");runtime_input_key_synthetic(code,down);}
-void runtime_input_clear(void){pthread_mutex_lock(&inputLock);memset(keys,0,sizeof(keys));pending=0;pthread_mutex_unlock(&inputLock);runtime_gamepad_clear();}
+/* Upstream 1.4.3 scene/player offsets. Safe reads only, once per Escape press.
+   Unknown (title/loading) and paused contexts get B; a live world gets Plus. */
+static uint64_t escape_button_for_state(int state){return state==BOW_NOT_DRAWN||state==BOW_DRAWN?1024:2;}
+#if defined(TOTK_GAME_V143)
+static int escape_read(uint64_t address,void *out,size_t size){
+ if(!address||address>UINT64_MAX-size)return 0;
+ mach_vm_size_t got=0;
+ return mach_vm_read_overwrite(mach_task_self(),address,size,(mach_vm_address_t)out,&got)==KERN_SUCCESS&&got==size;
+}
+#endif
+static uint64_t escape_button(void){
+ int state=BOW_UNKNOWN;
+#if defined(TOTK_GAME_V143)
+ BowTotkCache cache={0};uint64_t base=(uint64_t)runtime_module_base("main");
+ if(base)state=bow_state_totk143(base,0x3add238,0x218,escape_read,&cache);
+#endif
+ uint64_t b=escape_button_for_state(state);
+ fprintf(stderr,"[keyboard] Escape: state=%d -> %s\n",state,b==1024?"pause menu (+)":"back (B)");
+ return b;
+}
+void runtime_input_key(unsigned code,int down){
+ if(code>=128)return;
+ if(down)user_input("keyboard");
+ if(code==36||code==49||code==53||code==35){
+  pthread_mutex_lock(&inputLock);
+  if(down&&!nativeButtons[code]){
+   uint64_t b=code==36?1:code==49?4:code==35?1024:escape_button();
+   nativeButtons[code]=b;pending|=b;
+  }else if(!down)nativeButtons[code]=0;
+  pthread_mutex_unlock(&inputLock);return;
+ }
+ runtime_input_key_synthetic(code,down);
+}
+void runtime_input_clear(void){pthread_mutex_lock(&inputLock);memset(keys,0,sizeof(keys));memset(nativeButtons,0,sizeof(nativeButtons));pending=0;mouseButtons=0;mousePending=0;mouseRX=mouseRY=0;mouse_look_reset(&mouseLook);pthread_mutex_unlock(&inputLock);runtime_gamepad_clear();}
 static void initialize(void){pthread_mutex_lock(&inputLock);enabled=true;pthread_mutex_unlock(&inputLock);fprintf(stderr,"[totk] native keyboard controller initialized\n");}
 /* Docked: one full-key controller as player 1 (id 0, style bit 0). Handheld (TOTK_OPERATION_MODE=handheld, the iPhone):
    the same input is the handheld controller (id 0x20, style bit 1, joy-cons attached) and player 1 is not connected;
@@ -59,8 +141,9 @@ static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_st
 static int full_states(NpadState *out,int max,const uint32_t *id){return pad_states(out,max,id,1);}
 static int handheld_states(NpadState *out,int max,const uint32_t *id){return pad_states(out,max,id,2);}
 static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_style){if(max<=0)return 0;if(id)input_log(want_style==2?"handheld state":"full-key state",*id);if(!out||!id)runtime_fail("controller output pointer");pthread_mutex_lock(&inputLock);NpadState state={.sampling=++sample};if(enabled&&allowed&&*id==pad_id()&&want_style==pad_style()&&(styles&want_style)){
- state.attributes=1;for(unsigned i=0;i<128;i++)if(keys[i])state.buttons|=button(i);state.buttons|=pending;pending=0;
+ state.attributes=1;for(unsigned i=0;i<128;i++){if(keys[i])state.buttons|=button(i);state.buttons|=nativeButtons[i];}state.buttons|=pending|mouse_buttons()|mousePending;pending=0;mousePending=0;
  state.lx=32767*((int)keys[2]-(int)keys[0]);state.ly=32767*((int)keys[13]-(int)keys[1]);state.rx=32767*((int)keys[124]-(int)keys[123]);state.ry=32767*((int)keys[126]-(int)keys[125]);
+ if(abs(mouseRX)>abs(state.rx))state.rx=mouseRX;if(abs(mouseRY)>abs(state.ry))state.ry=mouseRY;
  RuntimeGamepadState pad;runtime_gamepad_read(&pad);state.buttons|=pad.buttons;
  if(pad.buttons&~padSeen||abs(pad.lx)>16384||abs(pad.ly)>16384||abs(pad.rx)>16384||abs(pad.ry)>16384)user_input("controller");padSeen=pad.buttons;
  if(abs(pad.lx)>abs(state.lx))state.lx=pad.lx;if(abs(pad.ly)>abs(state.ly))state.ly=pad.ly;

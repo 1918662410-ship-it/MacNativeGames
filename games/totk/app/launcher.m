@@ -414,6 +414,7 @@ static NSString *env_string(const char *name) {
 - (BOOL)saveSettings:(NSString *)profile mod:(NSString *)mod {
     NSDictionary *d = @{
         @"profile": profile ?: @"",
+        @"language": env_string("TOTK_LANG") ?: ([self.saved[@"language"] isKindOfClass:NSString.class] ? self.saved[@"language"] : @""),
         @"mod": mod ?: @"",
         @"fps": @(self.fpsCheck.state == NSControlStateValueOn),
         @"shader": @(self.shaderCheck.state == NSControlStateValueOn),
@@ -499,6 +500,11 @@ static NSString *env_string(const char *name) {
         show_error(@"Cannot open the game folder inside the app.");
         return;
     }
+    // Keep a per-game language choice across Finder launches; explicit environment wins.
+    NSString *language = env_string("TOTK_LANG");
+    if (!language.length && [self.saved[@"language"] isKindOfClass:NSString.class]) language = self.saved[@"language"];
+    if ([@[@"ja", @"en-US", @"en-GB", @"fr", @"fr-CA", @"de", @"es", @"es-419", @"it", @"nl", @"pt", @"pt-BR", @"ru", @"ko", @"zh-Hans", @"zh-Hant"] containsObject:language ?: @""])
+        setenv("TOTK_LANG", language.UTF8String, 1);
     setenv("TOTK_PROFILE_DIR", profile.fileSystemRepresentation, 1);
     setenv("TOTK_SHADER_CACHE", self.defaultCache.fileSystemRepresentation, 1);
     setenv("TOTK_GAME_SLOT_DIR", self.defaultSlot.fileSystemRepresentation, 1);
@@ -531,7 +537,7 @@ static NSString *env_string(const char *name) {
       if (o.length && strcasecmp(o.UTF8String, "auto") && strcmp(o.UTF8String, "0")) setenv("TOTK_OUTPUT_RES", o.UTF8String, 1);
       else unsetenv("TOTK_OUTPUT_RES"); }
     { NSString *w = [self trimmed:self.windowSizeField.stringValue ?: @""];
-      if (w.length) setenv("TOTK_WINDOW_SIZE", w.UTF8String, 1); else unsetenv("TOTK_WINDOW_SIZE"); }
+      if (w.length) { setenv("TOTK_WINDOW_SIZE", w.UTF8String, 1); unsetenv("TOTK_WINDOW_MAX"); } else unsetenv("TOTK_WINDOW_SIZE"); }
     { NSString *fill = @[@"fit", @"stretch", @"crop"][MAX(0, MIN(2, self.fillPopup.indexOfSelectedItem))];
       setenv("TOTK_PICTURE_FILL", fill.UTF8String, 1); }
     setenv("TOTK_GAMEPAD_SWAP_ABXY", self.swapCheck.state == NSControlStateValueOn ? "1" : "0", 1);

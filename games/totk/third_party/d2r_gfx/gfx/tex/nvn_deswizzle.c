@@ -82,3 +82,34 @@ int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const vo
 int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, size_t src_pitch, void *dst) {
     return move(d, level, layer, (uint8_t *)dst, (uint8_t *)src, src_pitch, 0);
 }
+
+// Write a sub-rectangle of one level / layer / slice straight into block-linear (or pitch) storage, without
+// round-tripping the whole level. x0 / width are in bytes, y0 / height in block rows; src rows are src_pitch apart.
+int nvn_swizzle_region(const nvn_texdesc *d, unsigned level, unsigned layer, uint32_t slice,
+                       uint32_t x0, uint32_t y0, uint32_t width, uint32_t height,
+                       const void *src, size_t src_pitch, void *dst) {
+    const uint8_t *in = (const uint8_t *)src; uint8_t *bl = (uint8_t *)dst;
+    if (nvn_tex_is_linear(d)) {
+        if (level || layer || slice || d->samples > 1 || (d->target != 0 && d->target != 1 && d->target != 7)) return -1;
+        int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
+        if (!bpb) return -1;
+        size_t row = (size_t)((d->width + bw - 1) / bw) * bpb;
+        uint32_t rows = d->target == 0 ? 1 : (d->height + bh - 1) / bh, stride = nvn_tex_linear_stride(d);
+        if ((size_t)x0 + width > row || (uint64_t)y0 + height > rows || stride < row) return -1;
+        for (uint32_t y = 0; y < height; y++) memcpy(bl + (size_t)(y0 + y) * stride + x0, in + (size_t)y * src_pitch, width);
+        return 0;
+    }
+    uint32_t row_bytes, rows, slices, bpb; uint64_t base; unsigned th, td;
+    if (nvn_deswizzle_geom(d, level, layer, &row_bytes, &rows, &slices, &base, &th, &td, &bpb)) return -1;
+    if ((uint64_t)x0 + width > row_bytes || (uint64_t)y0 + height > rows || slice >= slices) return -1;
+    bl += base;
+    for (uint32_t y = 0; y < height; y++) {
+        const uint8_t *row = in + (size_t)y * src_pitch;
+        for (uint32_t x = x0, end = x0 + width; x < end; ) {
+            uint32_t n = 16 - x % 16; if (n > end - x) n = end - x;   // 16 bytes are contiguous within a GOB
+            memcpy(bl + nvn_bl_offset(x, y0 + y, slice, row_bytes, rows, th, td), row + (x - x0), n);
+            x += n;
+        }
+    }
+    return 0;
+}

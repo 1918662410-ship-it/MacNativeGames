@@ -92,7 +92,113 @@ def check(what, got, want):
                          f'(is this Tears of the Kingdom 1.0.0, and the dump complete?)')
 
 
+import struct
+
+# Backported from upstream PR #47: signed NPDM and structurally valid BFTTF.
+NINTENDO_ACID_MODULUS = bytes.fromhex(
+    'DDC8DDF24E6DF0CA9EC75DC77BADFE7D238969B6F206A20288E15591ABCB4D50'
+    '2EFC9D9476D64CD8FF10FA5E930AB457AC51C71666F41A54C2C5043D1BFE3020'
+    '8AAC6F6FF5C7B668B8C9406B42AD1121E78BE9750186E4489B0A0AF87FE887F2'
+    '8201E6A30FE466AE833F4E9F5E0130A400B99AAE5F03CC1860E5EF3B5E1516FE'
+    '1C8278B52F477C0666885D35A2672010E76C4368D3E45A682A5AE26D73B03153'
+    '1C200944F51A9D22BE12A17711E2A1CD409AA28B609BEFA0D34863A2F8A32C08'
+    '56522E6019675AA79FDC3F3F692B316AB7884A148480333C9D44B73F4CE175EA'
+    '37EAE81E7C77B7C61AA2F09F1061CD7B5B324C37EFB17168530AED517D3522FD'
+)
+
+# ---- genuine dumps ----
+def _mgf1_sha256(seed, length):
+    blocks = b''
+    for counter in range((length + 31) // 32):
+        blocks += hashlib.sha256(seed + counter.to_bytes(4, 'big')).digest()
+    return blocks[:length]
+
+
+def _pss_sha256_valid(signature, modulus, message):
+    """RSA-2048 PSS/SHA-256 (32-byte salt, MGF1-SHA256), the scheme of an ACID block's signature."""
+    size = len(modulus)
+    if size < 256 or len(signature) != size:
+        return False
+    modulus_number = int.from_bytes(modulus, 'big')
+    number = int.from_bytes(signature, 'big')
+    if number >= modulus_number:
+        return False
+    encoded = pow(number, 0x10001, modulus_number).to_bytes(size, 'big')
+    if encoded[-1] != 0xBC:
+        return False
+    hashed, mask = encoded[size - 33:size - 1], _mgf1_sha256(encoded[size - 33:size - 1], size - 33)
+    db = bytes([(encoded[0] ^ mask[0]) & 0x7F]) + bytes(a ^ b for a, b in zip(encoded[1:size - 33], mask[1:]))
+    if db[:-33].strip(b'\x00') or db[-33] != 0x01:
+        return False
+    return hashlib.sha256(b'\x00' * 8 + hashlib.sha256(message).digest() + db[-32:]).digest() == hashed
+
+
+def npdm_signed(path):
+    """True when the npdm's ACID block carries a valid Nintendo signature over its own access control.
+
+    The pinned SHA-256 identifies the reference dump; the signature identifies every genuine dump of the
+    version, which is why this is the one ExeFS file that does not have to match byte for byte.
+    """
+    data = path.read_bytes()
+    if len(data) < 0x80 or data[:4] != b'META' or int.from_bytes(data[0x04:0x08], 'little') != 0:
+        return False
+    acid, acid_size = struct.unpack_from('<II', data, 0x78)
+    if acid_size < 0x200 or acid + acid_size > len(data) or data[acid + 0x200:acid + 0x204] != b'ACID':
+        return False
+    size = struct.unpack_from('<I', data, acid + 0x204)[0]
+    if size < 0x100 or acid + 0x100 + size > len(data):
+        return False
+    return _pss_sha256_valid(data[acid:acid + 0x100], NINTENDO_ACID_MODULUS, data[acid + 0x100:acid + 0x100 + size])
+
+
+def npdm_program_id(path):
+    """The program ID in a well-formed npdm's ACI0 block (16 upper-case hex digits), else None."""
+    data = path.read_bytes()
+    if len(data) < 0x80 or data[:4] != b'META':
+        return None
+    aci, aci_size = struct.unpack_from('<II', data, 0x70)
+    if aci_size < 0x20 or aci + aci_size > len(data) or data[aci:aci + 4] != b'ACI0':
+        return None
+    return f'{struct.unpack_from("<Q", data, aci + 0x10)[0]:016X}'
+
+
+def npdm_kind(path, title):
+    """How a main.npdm that is not the reference dump's file is accepted: 'signed' (Nintendo's ACID signature: another
+    genuine dump), 'resigned' (a well-formed npdm of this title whose ACID a dump tool signed again, as tools that change
+    an NCA's key generation do), else None. The game never reads main.npdm here, and the code modules are checked by
+    hash, so a re-signed one is accepted only alongside matching code (exefs_matches, step_code)."""
+    if npdm_signed(path):
+        return 'signed'
+    return 'resigned' if npdm_program_id(path) == title.upper() else None
+
+
+def exefs_matches(exefs, expected, title):
+    """True when the extracted ExeFS holds the expected code modules and a main.npdm of this version (npdm_kind)."""
+    for name, digest in expected.items():
+        if name != 'main.npdm' and (not (exefs / name).is_file() or sha256(exefs / name) != digest):
+            return False
+    npdm = exefs / 'main.npdm'
+    return 'main.npdm' not in expected or (npdm.is_file() and (sha256(npdm) == expected['main.npdm'] or npdm_kind(npdm, title) is not None))
+
+
+def _bfttf_valid(path):
+    """A structurally valid shared font, by the same size check scripts/extract_shared_fonts.py makes."""
+    data = path.read_bytes()
+    if len(data) < 12:
+        return False
+    magic, size = struct.unpack_from('>II', data)
+    key = magic ^ 0x7f9a0218
+    if (size ^ key) + 8 != len(data):
+        return False
+    return struct.unpack_from('>I', data, 8)[0] ^ key in (0x00010000, 0x4F54544F)
+
 # ---- prerequisites ----
+def m3_minimum(env=None):
+    """Ventura remains opt-in until game rendering has been validated."""
+    env = os.environ if env is None else env
+    return '13.0' if env.get('TOTK_M3_EXPERIMENTAL_MACOS13', '') not in ('', '0') else '15.0'
+
+
 def prerequisites(args):
     if platform.system() != 'Darwin' or platform.machine() != 'arm64':
         raise BuildError('needs a Mac with Apple silicon')
@@ -100,7 +206,7 @@ def prerequisites(args):
     # TOTK_M3=1：Metal 3 版最低 macOS 15（图形后端不用 Metal 4）
     # TOTK_M3=1: the Metal 3 build needs macOS 15 (the graphics backend does not use Metal 4)
     m3 = os.environ.get('TOTK_M3', '') not in ('', '0')
-    need = 15 if m3 else 26
+    need = int(m3_minimum().split(".")[0]) if m3 else 26
     if major < need:
         raise BuildError(f'needs macOS {need} or later ({"Metal 3" if m3 else "Metal 4"}); this is macOS {platform.mac_ver()[0]}')
     if subprocess.run(['xcrun', '--find', 'clang'], capture_output=True).returncode:
@@ -224,17 +330,14 @@ def identify_update(tree, game, keys, logs):
     source = prepare_update_container(tree, game, keys, logs)
     for version in ('v112', 'v143'):
         exefs = tree / f'extracted/{version}/exefs'
-        if source_matches(exefs.parent / 'extraction-manifest.json', source) and all(
-                (exefs / name).is_file() and sha256(exefs / name) == digest
-                for name, digest in VERSIONS[version]['exefs_sha256'].items()):
+        if source_matches(exefs.parent / 'extraction-manifest.json', source) and exefs_matches(exefs, VERSIONS[version]['exefs_sha256'], VERSIONS[version]['title_id']):
             return version, source
     staging = tree / 'extracted/update-detection'
     if staging.exists(): shutil.rmtree(staging)
     run([tree / '.venv/bin/python', 'scripts/extract_exefs.py', source, '--keys', keys,
          '--update', '--output', staging / 'exefs'], logs / 'identify-update.log', cwd=tree)
-    actual = {path.name: sha256(path) for path in (staging / 'exefs').iterdir()}
     version = next((version for version in ('v112', 'v143')
-                    if actual == VERSIONS[version]['exefs_sha256']), None)
+                    if exefs_matches(staging / 'exefs', VERSIONS[version]['exefs_sha256'], VERSIONS[version]['title_id'])), None)
     if version is None:
         raise BuildError('unsupported update module hashes; expected 1.1.2 or 1.4.3 (the file name is not used to choose a version)')
     target = tree / f'extracted/{version}'
@@ -248,16 +351,21 @@ def identify_update(tree, game, keys, logs):
 
 
 def font_report(folder):
-    """Only known font bytes can be bound into this version's runtime."""
+    """Accept structurally valid BFTTF files; bind the runtime to their actual hashes (upstream PR #47)."""
     rows = []
     for kind, (name, expected) in enumerate(EXPECTED['shared_fonts_sha256'].items()):
         path = folder / f'{kind}-{name}.bfttf'
         if not path.is_file():
             raise BuildError(f'missing shared font: {path}')
-        check(f'shared font {name}', sha256(path), expected)
+        digest = sha256(path)
+        if digest != expected:
+            if not _bfttf_valid(path):
+                raise BuildError(f'shared font {name}: not the expected bytes and not a valid BFTTF font '
+                                 f'(SHA-256 {digest[:16]}...)')
+            say(f'2/4 data: shared font {name} comes from another firmware version; its bytes are bound instead')
         size = path.stat().st_size
-        rows.append(dict(type=kind, name=name, bfttf_bytes=size, font_bytes=size - 8, sha256=expected))
-    return dict(status='pass', integrity='Each shared font matches the verified SHA-256 for this build', fonts=rows)
+        rows.append(dict(type=kind, name=name, bfttf_bytes=size, font_bytes=size - 8, sha256=digest))
+    return dict(status='pass', integrity='Each shared font is a valid BFTTF; the reference dump matches its pinned SHA-256', fonts=rows)
 
 
 def validate_fonts(folder):
@@ -288,7 +396,7 @@ def step_code(tree, game, keys, env, logs, *, version="v0"):
     exefs = tree / f'extracted/{version}/exefs'
     want = expected['exefs_sha256']
     manifest = exefs.parent / 'extraction-manifest.json'
-    if not source_matches(manifest, game) or not all((exefs / n).is_file() and sha256(exefs / n) == h for n, h in want.items()):
+    if not source_matches(manifest, game) or not exefs_matches(exefs, want, expected['title_id']):
         say('1/4 code: extracting the ExeFS from the game file')
         if exefs.exists():
             shutil.rmtree(exefs)
@@ -297,7 +405,17 @@ def step_code(tree, game, keys, env, logs, *, version="v0"):
     for n, h in want.items():
         if not (exefs / n).is_file():
             raise BuildError(f'ExeFS {n} is missing; not the supported version')
-        check(f'ExeFS {n}', sha256(exefs / n), h)
+        got = sha256(exefs / n)
+        if got == h:
+            continue
+        kind = npdm_kind(exefs / n, expected['title_id']) if n == 'main.npdm' else None
+        if kind == 'signed':
+            say(f"1/4 code: main.npdm is a Nintendo-signed {expected['display_version']} file from another dump; using it")
+            continue
+        if kind == 'resigned':
+            say(f"1/4 code: main.npdm metadata is re-signed; all code modules must still match {expected['display_version']}")
+            continue
+        check(f'ExeFS {n}', got, h)
     if not (tree / f'extracted/{version}/elf/main-inventory.json').exists():
         run([py, 'scripts/prepare_modules.py', exefs, '--output', tree / f'extracted/{version}/elf'], logs / 'prepare_modules.log', cwd=tree)
     out = tree / f'rewritten/{version}'
@@ -529,7 +647,7 @@ def step_binary(tree, game, keys, env, logs, *, version="v0"):
     m3 = env.get('TOTK_M3', '') not in ('', '0')
     target = ('runtime-m3' if m3 else 'runtime') if version == 'v0' else (f'runtime-{version}-m3' if m3 else f'runtime-{version}')
     if m3:
-        env.setdefault('MACOS_MIN_M3', '15.0')
+        env['MACOS_MIN_M3'] = m3_minimum(env)
         say(f'   Metal 3 build: minimum system macOS {env["MACOS_MIN_M3"]}, graphics backend without Metal 4')
     run(['make', target], logs / 'runtime.log', cwd=tree, env=env)
     run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *([] if version == 'v0' else [f'-DTOTK_GAME_{version.upper()}=1']), *(['-mmacosx-version-min=' + env.get('MACOS_MIN_M3', '15.0')] if m3 else []), 'app/launcher.m', '-framework', 'AppKit', '-framework', 'GameController',
@@ -595,7 +713,7 @@ def step_app(tree, out, logs, *, version="v0"):
     clone(tree / 'build/app-launcher', tmp / 'Contents/MacOS/TOTK')
     info = dict(CFBundleDevelopmentRegion='en', CFBundleExecutable='TOTK', CFBundleIdentifier=BUNDLE_ID, CFBundleName=APP_NAME,
                 CFBundleDisplayName=APP_NAME, CFBundlePackageType='APPL', CFBundleShortVersionString=expected['display_version'],
-                CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion=('15.0' if m3 else '26.0'), NSHighResolutionCapable=True,
+                CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion=(m3_minimum() if m3 else '26.0'), NSHighResolutionCapable=True,
                 LSApplicationCategoryType='public.app-category.action-games', LSSupportsGameMode=True,
                 GCSupportsControllerUserInteraction=True,
                 # Wireless game controllers: GameController's discovery goes through Bluetooth; macOS 15 asks for the

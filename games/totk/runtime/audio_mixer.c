@@ -1,4 +1,5 @@
 #include <TargetConditionals.h>
+#include <time.h>
 /* Audio renderer mixing stage and the IAudioDevice service.
    Per 5 ms frame (called by audio_renderer.c with the renderer lock held, before voices advance):
    voices are decoded (PCM8/16/32, float, Nintendo DSP-ADPCM) and resampled to the output rate with linear
@@ -35,6 +36,7 @@ typedef struct Mixer {
     SplitInfo *split; int nsplit; SplitDest *dest; int ndest;
     AudioComponentInstance unit; int unit_ok;
     float ring[RING_FRAMES * 2]; _Atomic uint64_t wr, rd, underruns, overruns;
+    _Atomic uint64_t last_pull_ns, max_pull_gap_ns, pull_calls;
     EffectState *effect; int *effect_order; unsigned effect_reported;
     unsigned reported;                             /* one-time reports */
 } Mixer;
@@ -49,6 +51,15 @@ static void report_once(Mixer *m, unsigned bit, const char *msg, int value) {
 static OSStatus pull(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io) {
     (void)flags; (void)ts; (void)bus;
     Mixer *m = ctx; float *out = io->mBuffers[0].mData;
+    // Callback-side diagnostics use atomics only: no allocation, locks or logging.
+    uint64_t now=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    uint64_t last=atomic_exchange_explicit(&m->last_pull_ns,now,memory_order_relaxed);
+    atomic_fetch_add_explicit(&m->pull_calls,1,memory_order_relaxed);
+    if(last && now>=last) {
+        uint64_t gap=now-last, maximum=atomic_load_explicit(&m->max_pull_gap_ns,memory_order_relaxed);
+        while(gap>maximum && !atomic_compare_exchange_weak_explicit(&m->max_pull_gap_ns,&maximum,gap,memory_order_relaxed,memory_order_relaxed)) {}
+    }
+
     uint64_t rd = atomic_load(&m->rd), wr = atomic_load_explicit(&m->wr, memory_order_acquire), have = wr - rd;
     UInt32 n = frames < have ? frames : (UInt32)have;
     for (UInt32 i = 0; i < n; i++) { uint64_t k = (rd + i) % RING_FRAMES; out[2 * i] = m->ring[2 * k]; out[2 * i + 1] = m->ring[2 * k + 1]; }
@@ -76,7 +87,14 @@ static void output_open(Mixer *m, int rate) {
 }
 static void output_push(Mixer *m, const float *lr, int frames) {
     uint64_t wr = atomic_load(&m->wr), rd = atomic_load_explicit(&m->rd, memory_order_acquire);
-    if (m->unit_ok && wr + (uint64_t)frames - rd > RING_FRAMES) { atomic_fetch_add(&m->overruns, 1); return; }   /* device stalled: drop this frame */
+    if (m->unit_ok && wr + (uint64_t)frames - rd > RING_FRAMES) {
+        uint64_t drops=atomic_fetch_add(&m->overruns,1)+1;
+        if((drops&(drops-1))==0) {
+            uint64_t now=clock_gettime_nsec_np(CLOCK_UPTIME_RAW),last=atomic_load(&m->last_pull_ns);
+            fprintf(stderr,"[totk-audio] overflow trace: at %.3f s, dropped blocks %llu, queued %llu frames, callback age %.3f ms\n",now/1e9,(unsigned long long)drops,(unsigned long long)(wr-rd),last&&now>=last?(now-last)/1e6:-1.0);
+        }
+        return;
+    }   /* device stalled: drop this frame */
     for (int i = 0; i < frames; i++) { uint64_t k = (wr + (uint64_t)i) % RING_FRAMES; m->ring[2 * k] = lr[2 * i]; m->ring[2 * k + 1] = lr[2 * i + 1]; }
     atomic_store_explicit(&m->wr, wr + (uint64_t)frames, memory_order_release);
     if (!m->unit_ok) atomic_store(&m->rd, wr + (uint64_t)frames);   /* no device: the ring only keeps the latest frames */
@@ -489,6 +507,8 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
       if (frames_total >= (uint64_t)r->param.sample_rate * 5) {
           fprintf(stderr, "[totk-audio] output level: rms %.4f peak %.4f over %.1f s, underruns %llu, overruns %llu\n", sqrt(sum / (double)count), peak,
                   frames_total / (double)r->param.sample_rate, (unsigned long long)atomic_load(&m->underruns), (unsigned long long)atomic_load(&m->overruns));
+          uint64_t rd=atomic_load_explicit(&m->rd,memory_order_acquire),wr=atomic_load_explicit(&m->wr,memory_order_acquire);
+          fprintf(stderr,"[totk-audio] queue trace: at %.3f s, queued %llu frames, callbacks %llu, max callback gap %.3f ms\n",clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1e9,(unsigned long long)(wr>=rd?wr-rd:0),(unsigned long long)atomic_exchange(&m->pull_calls,0),atomic_exchange(&m->max_pull_gap_ns,0)/1e6);
           sum = peak = 0; count = frames_total = 0;
       } }
     output_push(m, lr, frames);

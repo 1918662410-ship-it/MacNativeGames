@@ -195,3 +195,5 @@ void runtime_gamepad_read(RuntimeGamepadState *out) {
     pressedEdges = 0;
     pthread_mutex_unlock(&gamepadLock);
 }
+
+uint64_t runtime_gamepad_held_buttons(void){pthread_mutex_lock(&gamepadLock);uint64_t b=gamepadState.buttons|touchState.buttons;pthread_mutex_unlock(&gamepadLock);return b;}

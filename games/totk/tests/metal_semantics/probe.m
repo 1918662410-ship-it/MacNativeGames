@@ -6,6 +6,10 @@
 // Exit 1 on any difference. Run alone (GPU): make probe-metal-semantics.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import "../../third_party/d2r_gfx/gfx/nvn/m3_device.h"
+#if !DM_NVN_M3
+#define m3_default_device MTLCreateSystemDefaultDevice
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,12 +30,12 @@ static int failures, checks;
 static void expect(int ok, const char *what) { checks++; if (!ok) { failures++; printf("FAIL %s\n", what); } }
 
 int main(void) { @autoreleasepool {
-    id<MTLDevice> dev = MTLCreateSystemDefaultDevice(); id<MTLCommandQueue> q = [dev newCommandQueue]; NSError *e = nil;
+    id<MTLDevice> dev = m3_default_device(); id<MTLCommandQueue> q = [dev newCommandQueue]; NSError *e = nil;
     if (!dev) { printf("no Metal device\n"); return 1; }
     // 1 + 2: NaN / Inf through min / max / clamp / saturate and x * 0
     const float in[16] = {NAN, -NAN, INFINITY, -INFINITY, 0.5f, -0.5f, 2.0f, 0.0f, 3, 3, 3, 3, 3, 3, 3, 3};
     for (int safe = 1; safe >= 0; safe--) {
-        MTLCompileOptions *o = [MTLCompileOptions new]; o.mathMode = safe ? MTLMathModeSafe : MTLMathModeFast;
+        MTLCompileOptions *o = [MTLCompileOptions new]; o.fastMathEnabled = !safe;
         id<MTLLibrary> lib = [dev newLibraryWithSource:kMinMax options:o error:&e]; if (!lib) { printf("%s\n", e.localizedDescription.UTF8String); return 1; }
         id<MTLComputePipelineState> ps = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k"] error:&e]; if (!ps) return 1;
         id<MTLBuffer> bi = [dev newBufferWithBytes:in length:sizeof in options:MTLResourceStorageModeShared];

@@ -1,5 +1,7 @@
 GFX_SRC := $(wildcard third_party/d2r_gfx/gfx/nvn/*.c third_party/d2r_gfx/gfx/nvn/*.m third_party/d2r_gfx/gfx/nvn/*.S third_party/d2r_gfx/gfx/tex/*.c third_party/d2r_gfx/gfx/tex/*.m)
 GFX_OBJECTS := $(addprefix build/gfx/,$(addsuffix .o,$(GFX_SRC)))
+# Prerequisites expand when rules are parsed; define headers before the M3 rule.
+GFX_HEADERS := $(wildcard third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h)
 
 # ---- macOS 15 / Metal 3 变体（DM_NVN_M3）--------------------------------------------------------
 # 老接口版：图形后端不用 Metal 4（MTL4* 一律不出现），最低系统 macOS 15（Metal 3）。
@@ -151,7 +153,6 @@ verify-boot: runtime
 
 
 
-GFX_HEADERS := $(wildcard third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h)
 
 build/gfx/%.o: % $(GFX_HEADERS) Makefile
 	@mkdir -p "$(dir $@)"

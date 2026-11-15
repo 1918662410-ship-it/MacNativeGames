@@ -22,7 +22,7 @@ static RuntimeMotionState ring[MOTION_RING];
 static uint64_t produced, last_ns, logged, log_at, reads_logged;
 static double R[3][3];          /* controller -> reference; row i = reference axis i in controller coordinates */
 static double angle[3];
-static int restart = 1, live;
+static int restart = 1, live, mouseOwned;
 static int from[3] = {0, 1, 2};
 static double sign[3] = {1, 1, 1}, det = 1;
 
@@ -85,10 +85,11 @@ static void integrate(const double gyro[3], const double acc[3], double dt) {
     }
     memcpy(R, out, sizeof R); orthonormalize();
 }
-void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint64_t now) {
+static void motion_feed(const double raw_acc[3], const double raw_gyro[3], uint64_t now,int mouse) {
     double acc[3], gyro[3];
     pthread_mutex_lock(&lock);
-    for (int i = 0; i < 3; i++) { acc[i] = sign[i] * raw_acc[from[i]]; gyro[i] = det * sign[i] * raw_gyro[from[i]]; }
+    if(mouse != mouseOwned){pthread_mutex_unlock(&lock);return;}
+    for (int i = 0; i < 3; i++) { acc[i] = mouse ? raw_acc[i] : sign[i] * raw_acc[from[i]]; gyro[i] = mouse ? raw_gyro[i] : det * sign[i] * raw_gyro[from[i]]; }
     double dt = last_ns && now > last_ns ? (now - last_ns) / 1e9 : 0.004;
     if (dt > 0.05) dt = 0.004;   /* a gap (sensors were off, the app was in the background): no integration across it */
     last_ns = now; live = 1;
@@ -125,4 +126,8 @@ int runtime_motion_read(RuntimeMotionState *out, int max) {
     return n;
 }
 void runtime_motion_start(void) { pthread_mutex_lock(&lock); restart = 1; pthread_mutex_unlock(&lock); }
-void runtime_motion_live(int on) { pthread_mutex_lock(&lock); live = on; if (on) restart = 1; pthread_mutex_unlock(&lock); }
+void runtime_motion_live(int on) { pthread_mutex_lock(&lock); if(!mouseOwned){live = on; if (on) restart = 1;} pthread_mutex_unlock(&lock); }
+
+void runtime_motion_mouse(int on){pthread_mutex_lock(&lock);mouseOwned=!!on;restart=1;last_ns=0;live=0;pthread_mutex_unlock(&lock);}
+void runtime_motion_feed(const double a[3],const double g[3],uint64_t now){motion_feed(a,g,now,0);}
+void runtime_motion_feed_mouse(const double a[3],const double g[3],uint64_t now){motion_feed(a,g,now,1);}

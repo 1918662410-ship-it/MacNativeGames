@@ -256,6 +256,75 @@ class Containers(unittest.TestCase):
             with self.assertRaises(build_app.BuildError):
                 build_app.font_report(folder)
 
+    def test_npdm_signature_accepts_another_genuine_dump(self):
+        # The pinned hash names one dump; Nintendo's signature over the ACID block names every genuine one.
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding, rsa
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        # The signed body is acid->size bytes starting at acid+0x100 and includes the ACID header itself.
+        body = bytearray(bytes(range(256)) + b'access control')
+        body[0x100:0x104] = b'ACID'
+        struct.pack_into('<I', body, 0x104, len(body))
+        signature = key.sign(bytes(body), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32), hashes.SHA256())
+        npdm = bytearray(0x180 + len(body))
+        npdm[:4] = b'META'
+        struct.pack_into('<II', npdm, 0x78, 0x80, 0x100 + len(body))
+        npdm[0x80:0x180] = signature
+        npdm[0x180:0x180 + len(body)] = body
+        path = self.path / 'main.npdm'
+        path.write_bytes(npdm)
+        with patch.object(build_app, 'NINTENDO_ACID_MODULUS', key.public_key().public_numbers().n.to_bytes(256, 'big')):
+            self.assertTrue(build_app.npdm_signed(path))
+            tampered = bytearray(npdm)
+            tampered[0x180] ^= 1
+            path.write_bytes(tampered)
+            self.assertFalse(build_app.npdm_signed(path))
+            path.write_bytes(npdm)
+            struct.pack_into('<I', npdm, 0x04, 1)
+            path.write_bytes(npdm)
+            self.assertFalse(build_app.npdm_signed(path))
+
+    def test_font_from_another_firmware_is_bound_by_its_bytes(self):
+        folder = self.path / 'fonts'
+        folder.mkdir()
+        for i in range(6):
+            (folder / f'{i}-font{i}.bfttf').write_bytes(struct.pack('>III', 0x7F9A0218, 12, 0x00010000) + bytes([i]) * 8)
+        pinned = {f'font{i}': '0' * 64 for i in range(6)}
+        with patch.dict(build_app.EXPECTED, {'shared_fonts_sha256': pinned}):
+            report = build_app.font_report(folder)
+            self.assertEqual([row['sha256'] for row in report['fonts']],
+                             [hashlib.sha256((folder / f'{i}-font{i}.bfttf').read_bytes()).hexdigest() for i in range(6)])
+            (folder / '0-font0.bfttf').write_bytes(b'not a font')
+            with self.assertRaises(build_app.BuildError):
+                build_app.font_report(folder)
+
+    def test_resigned_npdm_is_accepted_only_with_matching_code(self):
+        # Dump tools that change an NCA's key generation sign the npdm's ACID again (#65, #80): not Nintendo's signature,
+        # but the title's own npdm; the game never reads it, so it passes when every code module matches.
+        def npdm(program_id):
+            data = bytearray(0x200)
+            data[:4] = b'META'
+            struct.pack_into('<II', data, 0x70, 0x100, 0x40)   # ACI0 at 0x100
+            data[0x100:0x104] = b'ACI0'
+            struct.pack_into('<Q', data, 0x110, program_id)
+            return bytes(data)
+        exefs = self.path / 'exefs'
+        exefs.mkdir()
+        code = {name: f'{name} bytes'.encode() for name in ('main', 'rtld', 'sdk', 'subsdk0')}
+        for name, data in code.items():
+            (exefs / name).write_bytes(data)
+        (exefs / 'main.npdm').write_bytes(npdm(0x0100F2C0115B6000))
+        expected = {name: hashlib.sha256(data).hexdigest() for name, data in code.items()}
+        expected['main.npdm'] = '0' * 64   # the reference dump's file is another one
+        self.assertEqual(build_app.npdm_program_id(exefs / 'main.npdm'), '0100F2C0115B6000')
+        self.assertEqual(build_app.npdm_kind(exefs / 'main.npdm', '0100f2c0115b6000'), 'resigned')
+        self.assertTrue(build_app.exefs_matches(exefs, expected, '0100F2C0115B6000'))
+        self.assertFalse(build_app.exefs_matches(exefs, expected, '01007EF00011E000'))   # another title's npdm
+        (exefs / 'sdk').write_bytes(b'patched sdk')
+        self.assertFalse(build_app.exefs_matches(exefs, expected, '0100F2C0115B6000'))   # code that differs still stops it
+        (exefs / 'main.npdm').write_bytes(b'META' + bytes(0x7c))   # no ACI0
+        self.assertIsNone(build_app.npdm_kind(exefs / 'main.npdm', '0100F2C0115B6000'))
+
     def test_nsp_missing_fonts_stops_before_build(self):
         game = self.path / 'game.nsp'
         game.write_bytes(game_image('nsp'))

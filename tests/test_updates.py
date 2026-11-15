@@ -14,7 +14,7 @@ from test_game_containers import (HEADER, AREA, TITLEKEK, CONTENT, SCRIPTS, TITL
                                   encrypt, nca, partition, ticket, game_image, romfs)
 from cryptography.hazmat.primitives.ciphers import modes
 from extract_exefs import decrypt, common_tickets, container_entries
-from extract_update_romfs import merge
+from extract_update_romfs import hactool_prod_keys, merge
 import build_app
 
 
@@ -39,6 +39,80 @@ class Updates(unittest.TestCase):
                             [('header_key', HEADER), ('key_area_key_application_00', AREA), ('titlekek_00', TITLEKEK)]))
         self.update = self.root/'update.nsp'
         self.update.write_bytes(partition([('program.nca', update_nca()), ('common.tik', ticket())]))
+
+    def test_nul_padded_kek_source_is_stripped_for_hactool(self):
+        body = '11' * 16
+        original = self.keys.read_text()
+        if not original.endswith('\n'):
+            original += '\n'
+        extra = (f'master_kek_source_06 = {body}00\n'
+                 f'mariko_master_kek_source_05 = {body.upper()}00 # kept\n'
+                 '# a comment line\n'
+                 f'titlekek_01 = {"33" * 16}   # hactool would read this note as part of the value\n')
+        self.keys.write_text(original + extra)
+        out = self.root/'hactool.keys'
+        hactool_prod_keys(self.keys, out)
+        self.assertEqual(os.stat(out).st_mode & 0o777, 0o600)
+        lines = out.read_text().splitlines()
+        self.assertIn(f'master_kek_source_06 = {body}', lines)
+        self.assertIn(f'mariko_master_kek_source_05 = {body.upper()}', lines)
+        self.assertIn(f'titlekek_01 = {"33" * 16}', lines)
+        self.assertFalse([line for line in lines if '#' in line])
+        self.assertEqual(len(lines), len([line for line in original.splitlines() if '=' in line]) + 3)
+        self.assertEqual(self.keys.read_text(), original + extra)
+        bad = self.root/'bad.keys'
+        bad.write_text(f'master_kek_source_06 = {body}ff\n')
+        with self.assertRaisesRegex(ValueError, 'master_kek_source_06 must be 16 bytes') as caught:
+            hactool_prod_keys(bad, self.root/'rejected.keys')
+        self.assertNotIn(body, str(caught.exception))
+        self.assertFalse((self.root/'rejected.keys').exists())
+
+    def test_merge_passes_stripped_kek_sources_only(self):
+        space = patch('extract_update_romfs.shutil.disk_usage')
+        space.start().return_value.free = 100 * 2**30
+        self.addCleanup(space.stop)
+        body = '22' * 16
+        original = self.keys.read_text()
+        if not original.endswith('\n'):
+            original += '\n'
+        self.keys.write_text(original + f'master_kek_source_0a = {body}00\n')
+        before = self.keys.read_bytes()
+        helper = self.root/'hactool'
+        helper.write_text('#!'+sys.executable+'\n'+
+            'import os,sys,pathlib,stat\n'
+            f'body={body!r}\n'
+            'path=pathlib.Path(sys.argv[sys.argv.index("-k")+1])\n'
+            'assert stat.S_IMODE(path.stat().st_mode)==0o600\n'
+            'found=[line.split("=",1)[1].strip() for line in path.read_text().splitlines() if line.startswith("master_kek_source_0a")]\n'
+            'assert found==[body]\n'
+            'out=pathlib.Path(next(s.split("=",1)[1] for s in sys.argv if s.startswith("--section")))\n'
+            f'out.write_bytes({romfs()!r})\n'
+            'for i in range(6): print(f"Level {i} (GOOD)")\n')
+        helper.chmod(0o755)
+        base = self.root/'base.nsp'; base.write_bytes(game_image('nsp', managed=True))
+        merge(base, self.update, self.keys, helper, self.root/'merged')
+        self.assertEqual(self.keys.read_bytes(), before)
+        self.assertFalse(list(self.root.glob('update-merge-*')))
+
+    def test_merge_accepts_hactool_signature_checks_it_cannot_perform(self):
+        # Real hactool prints the NCA fixed-key and NPDM signature checks as (FAIL) on a successful merge:
+        # it has no Nintendo public key. The merge must judge the data, not those lines.
+        space = patch('extract_update_romfs.shutil.disk_usage')
+        space.start().return_value.free = 100 * 2**30
+        self.addCleanup(space.stop)
+        helper = self.root/'hactool'
+        helper.write_text('#!'+sys.executable+'\n'+
+            'import sys,pathlib\n'+
+            'out=pathlib.Path(next(s.split("=",1)[1] for s in sys.argv if s.startswith("--section")))\n'
+            f'out.write_bytes({romfs()!r})\n'
+            'print("Fixed-Key Signature (FAIL):")\n'
+            'print("NPDM Signature (FAIL):")\n'
+            'for i in range(6): print(f"Level {i} (GOOD)")\n')
+        helper.chmod(0o755)
+        base = self.root/'base.nsp'; base.write_bytes(game_image('nsp', managed=True))
+        out = self.root/'merged'
+        merge(base, self.update, self.keys, helper, out)
+        self.assertEqual((out/'romfs.bin').read_bytes(), romfs())
 
     def test_real_ticket_signature_byte_order(self):
         self.assertEqual(ticket()[:4], b'\x04\x00\x01\x00')

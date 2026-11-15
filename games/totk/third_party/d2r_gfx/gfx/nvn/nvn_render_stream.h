@@ -15,6 +15,9 @@
      after use (probes build pipeline states that go away right after the pass; the game's live in caches).
    No GPU ordering, resource retirement or uniform snapshot policy changes: B only encodes what A decided, in A's order. */
 #include "nvn_encode_fifo.h"
+#include "nvn_resource_use_cache.h"
+static nvn_resource_use_cache g_rs_resource_uses;
+static uint64_t g_rs_resource_emitted,g_rs_resource_reused;
 #include <TargetConditionals.h>
 #include <sched.h>
 #include <dispatch/dispatch.h>
@@ -22,7 +25,7 @@
 enum {
     RS_PSO, RS_DSS, RS_VIEWPORT, RS_SCISSOR, RS_CULL, RS_WINDING, RS_FILL,
     RS_BIAS, RS_CLIP, RS_STENCIL, RS_BLEND, RS_VISIBILITY, RS_ADDRESS,
-    RS_DRAW, RS_INSTANCED, RS_INDEXED, RS_STORE,
+    RS_DRAW, RS_INSTANCED, RS_INDEXED, RS_STORE, RS_RESOURCE, RS_BUFFER_FALLBACK,
     RS_BEGIN,   /* u[0] = retained MTL4RenderPassDescriptor, u[1] = vertex table, u[2] = fragment table, u[3] = command buffer, u[4] = barrier at start, u[5] = visibility options */
     RS_END,     /* end the encoder (barrier at end if u[0], visibility options u[1]) */
 };
@@ -58,13 +61,25 @@ static void rs_apply(id<MTL4RenderCommandEncoder> *enc, id<MTL4ArgumentTable> *v
     if (g_rs_probe_negative && (p->op == RS_DRAW || p->op == RS_INSTANCED || p->op == RS_INDEXED)) return;
     if (p->op != RS_BEGIN && !e) MDIE("render stream packet %llu without an encoder", (unsigned long long)p->op);
     switch (p->op) {
+        case RS_BUFFER_FALLBACK: m3_encoder_full_buffers(e); break;
+        case RS_RESOURCE: {
+            id<MTLResource> r=CFBridgingRelease((void *)(uintptr_t)u[0]);
+#if DM_NVN_M3
+            [e useResource:r usage:(MTLResourceUsage)u[1] stages:(MTLRenderStages)u[2]];
+#else
+            (void)r; MDIE("selective Metal 3 packet on a Metal 4 encoder");
+#endif
+            break;
+        }
+
         case RS_BEGIN: {
             if (e) MDIE("render stream: pass begun while the previous one is open");
             MTL4RenderPassDescriptor *d = (__bridge MTL4RenderPassDescriptor *)(void *)(uintptr_t)u[0];
             id<MTL4CommandBuffer> cb = (__bridge id<MTL4CommandBuffer>)(void *)(uintptr_t)u[3];
             *vt = (__bridge id<MTL4ArgumentTable>)(void *)(uintptr_t)u[1]; *ft = (__bridge id<MTL4ArgumentTable>)(void *)(uintptr_t)u[2];
-            e = [cb renderCommandEncoderWithDescriptor:d];
+            e = m3_encoder_begin([cb renderCommandEncoderWithDescriptor:d]);
             if (!e) MDIE("render stream: renderCommandEncoderWithDescriptor failed");
+            if(m3_selective_textures_enabled()) m3_encoder_selective(e);
             if (u[4] == 2) {   /* TOTK_BARRIER_NARROW: copies / compute order before every stage; earlier render work only before our fragment stage (the vertex stage overlaps the previous pass's fragment work) */
                 ((void)0);
                 ((void)0);
@@ -90,8 +105,8 @@ static void rs_apply(id<MTL4RenderCommandEncoder> *enc, id<MTL4ArgumentTable> *v
         case RS_BLEND: { float v[4]; memcpy(v, u, sizeof v); [e setBlendColorRed:v[0] green:v[1] blue:v[2] alpha:v[3]]; break; }
         case RS_VISIBILITY: [e setVisibilityResultMode:(MTLVisibilityResultMode)u[0] offset:(NSUInteger)u[1]]; break;
         case RS_ADDRESS: [(u[0] ? *ft : *vt) setAddress:u[2] atIndex:(NSUInteger)u[1]]; break;
-        case RS_DRAW: [e drawPrimitives:(MTLPrimitiveType)u[0] vertexStart:(NSUInteger)u[1] vertexCount:(NSUInteger)u[2]]; break;
-        case RS_INSTANCED: [e drawPrimitives:(MTLPrimitiveType)u[0] vertexStart:(NSUInteger)u[1] vertexCount:(NSUInteger)u[2] instanceCount:(NSUInteger)u[3] baseInstance:(NSUInteger)u[4]]; break;
+        case RS_DRAW: m3_use_resident_resources(e); [e drawPrimitives:(MTLPrimitiveType)u[0] vertexStart:(NSUInteger)u[1] vertexCount:(NSUInteger)u[2]]; break;
+        case RS_INSTANCED: m3_use_resident_resources(e); [e drawPrimitives:(MTLPrimitiveType)u[0] vertexStart:(NSUInteger)u[1] vertexCount:(NSUInteger)u[2] instanceCount:(NSUInteger)u[3] baseInstance:(NSUInteger)u[4]]; break;
         case RS_INDEXED: m3_draw_indexed(e, (MTLPrimitiveType)u[0], (NSUInteger)u[1], (MTLIndexType)u[2], u[3], (NSUInteger)u[4], (NSUInteger)u[5], (NSInteger)u[6], (NSUInteger)u[7]); break;
         case RS_STORE:
             if (u[0] == 1) [e setDepthStoreAction:(MTLStoreAction)u[1]];
@@ -222,7 +237,43 @@ static void rs_sub_end(void) {
              (unsigned long long)g_rs_syncs, g_rs_syncs ? (double)g_rs_sync_ns / (double)g_rs_syncs / 1e3 : 0.0, (double)g_rs_sync_max_ns / 1e3,
              (double)(g_rs_sync_ns - last_sync) / 1800.0 / 1e6, (unsigned long long)g_rs_full_waits, (double)(g_rs_full_ns - last_full) / 1800.0 / 1e6,
              (unsigned long long)atomic_load(&g_rs_b_sleeps), (double)(busy - last_busy) / 1800.0 / 1e6);
+        MLOG("[resource-use] emitted=%llu reused=%llu",(unsigned long long)g_rs_resource_emitted,(unsigned long long)g_rs_resource_reused);
         last_busy = busy; last_full = g_rs_full_ns; last_packets = g_rs_packets; last_sync = g_rs_sync_ns;
         g_rs_sync_max_ns = 0;
+    }
+}
+
+/* Declare actual indirect resources on the worker before its draw. A retained packet
+   carries the view safely across threads; normal submission retirement owns GPU lifetime. */
+/* Callers already distinguish buffers/textures from samplers through shader reflection.
+   Keep this typed: per-binding Objective-C protocol walks dominated replay CPU samples. */
+static void rs_use_indirect_resource(id encoder, id<MTLResource> resource, MTLResourceUsage usage, int vertex) {
+    if (!resource) return;
+    if (!rs_using(encoder)) { m3_use_compute_resource(encoder,resource,usage); return; }
+    if(!nvn_resource_use_emit(&g_rs_resource_uses,(uintptr_t)(__bridge void *)resource,g_rs_passes,(uint32_t)usage,vertex)) {
+        g_rs_resource_reused++; return;
+    }
+    g_rs_resource_emitted++;
+    rs_put((nvn_encode_packet){.op=RS_RESOURCE,.u={
+        (uint64_t)(uintptr_t)CFBridgingRetain(resource), (uint64_t)usage,
+        vertex ? MTLRenderStageVertex : MTLRenderStageFragment}},0);
+}
+
+/* Inline updates / uniform snapshots can point into a different allocation from
+   the original pool. Declare the allocation containing the actual GPU address. */
+static void rs_use_buffer_address(id encoder, uint64_t address, MTLResourceUsage usage, int vertex, id<MTLBuffer> original) {
+    if(!address) return;
+    if(!rs_using(encoder)) {
+#if DM_NVN_M3
+        if(m3_selective_compute_enabled()==2) m3_use_compute_buffer(encoder,replay_buffer_for_gpu(address,original),usage);
+#endif
+        return;
+    }
+    id<MTLBuffer> buffer=replay_buffer_for_gpu(address,original);
+    if(buffer) rs_use_indirect_resource(encoder,buffer,usage,vertex);
+    else {
+        static unsigned misses;
+        if(misses++<4)MLOG("[resource-use] unresolved GPU buffer %#llx; conservative pass fallback",(unsigned long long)address);
+        rs_put((nvn_encode_packet){.op=RS_BUFFER_FALLBACK},0);
     }
 }
